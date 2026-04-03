@@ -54,7 +54,8 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
     def __init__(self, tasks: list[Any], processor: Any, max_length: int) -> None:
         self.tasks = tasks
         self.processor = processor
-        self.max_length = max_length
+        # Increase max_length significantly because 256 tokens are reserved for the image alone
+        self.max_length = max_length + 256
 
     def __len__(self) -> int:
         return len(self.tasks)
@@ -62,22 +63,36 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
     def __getitem__(self, index: int) -> dict[str, Any]:
         task = self.tasks[index]
         image = grid_to_image(task.input_grid.values)
-        
         text_grid = serialize_task_for_teacher(task)
-        prompt = (
-            f"User:<image>\n"
-            f"{text_grid}\n"
-            f"Predict the best drone action family and halting step.\n"
-            f"Assistant:"
-        )
-        
+
+        # Strictly follow the multimodal message format for Gemma-4
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": f"Grid:\n{text_grid}\nPredict drone action and halt step."}
+                ]
+            }
+        ]
+
         action_idx = action_to_index(task.target_action)
         halt_step = halt_probability_to_step(halt_probability=task.target_action.halt_probability, refinement_steps=6)
-        answer = f"Action: {action_idx}, Halt: {halt_step}{self.processor.tokenizer.eos_token}"
+        answer = f"Action: {action_idx}, Halt: {halt_step}"
 
-        # Capture ALL keys (input_ids, attention_mask, pixel_values, pixel_position_ids, etc.)
+        # 1. Generate formatted prompt
+        prompt = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        # 2. Process image + prompt TOGETHER so the processor can expand image tokens
+        # The processor finds the <image> placeholder and replaces it with 256 tokens.
+        full_text = prompt + answer + self.processor.tokenizer.eos_token
+
         inputs = self.processor(
-            text=prompt + answer,
+            text=full_text,
             images=image,
             return_tensors="pt",
             padding="max_length",
@@ -85,12 +100,16 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
             truncation=True
         )
 
-        # Flatten batch dim for the dataloader
         payload = {k: v.squeeze(0) for k, v in inputs.items()}
 
-        # Create labels: mask out the prompt
-        full_tokens = self.processor.tokenizer(prompt).input_ids
-        prompt_len = len(full_tokens)
+        # 3. Create labels: find where the answer starts
+        # We re-process ONLY the prompt to find its length after expansion
+        prompt_inputs = self.processor(
+            text=prompt,
+            images=image,
+            return_tensors="pt"
+        )
+        prompt_len = prompt_inputs.input_ids.shape[1]
 
         labels = payload["input_ids"].clone()
         labels[:prompt_len] = -100
@@ -98,6 +117,7 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
         payload["labels"] = labels
 
         return payload
+
 
 
 def _parse_metrics_from_text(text: str) -> tuple[int | None, int | None]:
@@ -194,9 +214,7 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs} [Train]")
         for batch_idx, batch in enumerate(pbar):
-            # Move ALL keys to device (important for multimodal position IDs)
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            # Pixel values must be bfloat16
             if "pixel_values" in batch:
                 batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
             
