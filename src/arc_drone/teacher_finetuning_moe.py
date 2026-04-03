@@ -162,7 +162,7 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
     print("\nLoading Multimodal Processor...")
     processor = AutoProcessor.from_pretrained(config.foundation_model_id, trust_remote_code=True)
     
-    print("Loading Gemma MoE in 4-bit with Flash Attention 2...")
+    print("Loading Gemma MoE in 4-bit with SDPA attention...")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -175,7 +175,7 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         trust_remote_code=True,
     )
     
