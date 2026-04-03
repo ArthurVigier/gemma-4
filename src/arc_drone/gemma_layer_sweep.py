@@ -20,14 +20,61 @@ from .config import BenchmarkConfig
 from .student_training import ACTION_VOCABULARY, halt_probability_to_step
 
 
-def _lazy_import_transformers() -> tuple[Any, Any]:
+def _lazy_import_transformers() -> tuple[Any, Any, Any]:
     try:
-        from transformers import AutoModel, AutoTokenizer
+        from transformers import AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
     except Exception as exc:  # pragma: no cover - exercised only in training envs
         raise RuntimeError(
             "transformers is required for Gemma layer sweep. Install with `python3 -m pip install -e '.[training]'`."
         ) from exc
-    return AutoModel, AutoTokenizer
+    return AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+
+
+def _load_teacher_components(*, foundation_model_id: str, device: torch.device) -> tuple[Any, Any]:
+    AutoModelForImageTextToText, AutoProcessor, AutoTokenizer = _lazy_import_transformers()
+
+    processor = None
+    tokenizer = None
+    try:
+        processor = AutoProcessor.from_pretrained(foundation_model_id, trust_remote_code=True)
+        tokenizer = getattr(processor, "tokenizer", None)
+    except Exception:
+        processor = None
+
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(foundation_model_id, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    teacher_model = AutoModelForImageTextToText.from_pretrained(
+        foundation_model_id,
+        trust_remote_code=True,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+    ).to(device)
+    teacher_model.eval()
+
+    language_backbone = getattr(teacher_model, "language_model", None)
+    if language_backbone is None:
+        raise RuntimeError(
+            f"{foundation_model_id} did not expose a `language_model` submodule; Gemma-4 hidden-state sweep expects the language backbone."
+        )
+    language_backbone.eval()
+    return tokenizer, language_backbone
+
+
+def _extract_hidden_states(outputs: Any) -> tuple[Any, ...]:
+    hidden_states = getattr(outputs, "hidden_states", None)
+    if hidden_states is not None:
+        return hidden_states
+
+    nested = getattr(outputs, "language_model_outputs", None)
+    hidden_states = getattr(nested, "hidden_states", None)
+    if hidden_states is not None:
+        return hidden_states
+
+    raise RuntimeError("Unable to extract hidden states from Gemma language backbone outputs.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,13 +188,10 @@ def build_teacher_features(
     max_length: int,
     device: torch.device,
 ) -> tuple[dict[int, torch.Tensor], torch.Tensor, torch.Tensor, int]:
-    AutoModel, AutoTokenizer = _lazy_import_transformers()
-    tokenizer = AutoTokenizer.from_pretrained(foundation_model_id)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = AutoModel.from_pretrained(foundation_model_id).to(device)
-    model.eval()
+    tokenizer, language_backbone = _load_teacher_components(
+        foundation_model_id=foundation_model_id,
+        device=device,
+    )
 
     prompts = [serialize_task_for_teacher(task) for task in tasks]
     action_indices = torch.tensor(
@@ -175,8 +219,13 @@ def build_teacher_features(
                 max_length=max_length,
                 return_tensors="pt",
             ).to(device)
-            outputs = model(**encoded, output_hidden_states=True)
-            hidden_states = outputs.hidden_states
+            outputs = language_backbone(
+                input_ids=encoded["input_ids"],
+                attention_mask=encoded["attention_mask"],
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            hidden_states = _extract_hidden_states(outputs)
             hidden_layer_count = len(hidden_states) - 1
             attention_mask = encoded["attention_mask"]
             token_positions = attention_mask.sum(dim=1) - 1
