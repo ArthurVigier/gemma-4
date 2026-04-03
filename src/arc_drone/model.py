@@ -21,24 +21,43 @@ class TRMReasonerOutput:
     halted_at_step: Tensor
 
 
+class SpatialEncoder(nn.Module):
+    """Preserves 2D topology of the ARC grid using convolutional layers."""
+
+    def __init__(self, config: ReasonerConfig) -> None:
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(config.hidden_size, config.hidden_size, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(config.hidden_size, config.hidden_size, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(config.hidden_size, config.hidden_size, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(config.hidden_size, config.hidden_size),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Input x is (batch, H, W, hidden_size)
+        # Conv2d expects (batch, C, H, W)
+        x = x.permute(0, 3, 1, 2)
+        return self.cnn(x)
+
+
 class TRMReasoner(nn.Module):
     """A compact recursive reasoner with adaptive halting.
 
-    This is not the final Gemma-4 distilled student. Instead, it provides the
-    execution contract and recursive control loop expected by the final system.
+    This version uses a SpatialEncoder to better capture ARC-like 2D relations
+    from the symbolic grid.
     """
 
     def __init__(self, config: ReasonerConfig | None = None) -> None:
         super().__init__()
         self.config = config or ReasonerConfig()
-        cell_count = self.config.grid_height * self.config.grid_width
 
         self.embedding = nn.Embedding(self.config.color_count, self.config.hidden_size)
-        self.encoder = nn.Sequential(
-            nn.Linear(cell_count * self.config.hidden_size, self.config.hidden_size * 2),
-            nn.GELU(),
-            nn.Linear(self.config.hidden_size * 2, self.config.hidden_size),
-        )
+        self.encoder = SpatialEncoder(self.config)
         self.refiner = nn.GRUCell(self.config.hidden_size, self.config.hidden_size)
         self.halting_head = nn.Linear(self.config.hidden_size, 1)
         self.action_head = nn.Linear(self.config.hidden_size, self.config.action_dim)
@@ -51,8 +70,8 @@ class TRMReasoner(nn.Module):
 
         batch_size = grid.shape[0]
         embedded = self.embedding(grid.long())
-        flattened = embedded.reshape(batch_size, -1)
-        state = self.encoder(flattened)
+        # embedded is (batch, H, W, hidden_size)
+        state = self.encoder(embedded)
 
         hidden_states: list[Tensor] = [state]
         halt_logits: list[Tensor] = []
