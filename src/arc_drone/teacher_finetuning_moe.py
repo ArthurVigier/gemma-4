@@ -26,8 +26,8 @@ except Exception:
 from .arc_drone_bench import ARCDroneBench
 from .config import BenchmarkConfig
 from .gemma_layer_sweep import _lazy_import_transformers
-from .student_training import select_device, set_seed
-from .teacher_finetuning import TeacherHybridDataset
+from .student_training import action_to_index, halt_probability_to_step, select_device, set_seed
+from .teacher_finetuning import TeacherHybridDataset, grid_to_image
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +62,12 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
     def __getitem__(self, index: int) -> dict[str, Any]:
         task = self.tasks[index]
         image = grid_to_image(task.input_grid.values)
-        text_grid = serialize_task_for_teacher(task)
+        
+        # Serialize the grid manually
+        lines = []
+        for y in range(task.input_grid.height):
+            lines.append("".join(str(val) for val in task.input_grid.values[y]))
+        text_grid = "\n".join(lines)
 
         # MANUAL OVERRIDE: The AutoProcessor for Gemma-4 MoE currently fails to auto-expand
         # the <image> token. We manually inject 256 <image> tokens to match the ViT features.
@@ -79,11 +84,13 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
         halt_step = halt_probability_to_step(halt_probability=task.target_action.halt_probability, refinement_steps=6)
         answer = f"Action: {action_idx}, Halt: {halt_step}"
 
-        # We must use processor as a callable if it supports vision
-        # If processor is actually just a tokenizer (due to HF bug), it will ignore `images` kwarg safely
+        # Combine for full input
+        full_text = prompt + answer + self.processor.tokenizer.eos_token
+
+        # Use the processor to handle both image and text simultaneously
         try:
             inputs = self.processor(
-                text=prompt + answer + self.processor.tokenizer.eos_token,
+                text=full_text,
                 images=image,
                 return_tensors="pt",
                 padding="max_length",
@@ -91,20 +98,18 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
                 truncation=True
             )
         except TypeError:
-            # Fallback if AutoProcessor returned ONLY a tokenizer
             inputs = self.processor(
-                text=prompt + answer + self.processor.eos_token,
+                text=full_text,
                 return_tensors="pt",
                 padding="max_length",
                 max_length=self.max_length,
                 truncation=True
             )
-            # The model will fail without pixel_values if it's truly multimodal, 
-            # so we must assume an external image processor is missing.
             raise RuntimeError("AutoProcessor returned a basic tokenizer instead of a multimodal processor. Ensure transformers is up to date.")
 
         payload = {k: v.squeeze(0) for k, v in inputs.items()}
 
+        # Masking labels for the prompt part
         try:
             prompt_inputs = self.processor(
                 text=prompt,
