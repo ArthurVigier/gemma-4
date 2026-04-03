@@ -25,9 +25,9 @@ except Exception:
 
 from .arc_drone_bench import ARCDroneBench
 from .config import BenchmarkConfig
-from .gemma_layer_sweep import _lazy_import_transformers, serialize_task_for_teacher
-from .student_training import action_to_index, halt_probability_to_step, select_device, set_seed
-from .teacher_finetuning import grid_to_image
+from .gemma_layer_sweep import _lazy_import_transformers
+from .student_training import select_device, set_seed
+from .teacher_finetuning import TeacherHybridDataset
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +54,6 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
     def __init__(self, tasks: list[Any], processor: Any, max_length: int) -> None:
         self.tasks = tasks
         self.processor = processor
-        # Increase max_length significantly because 256 tokens are reserved for the image alone
         self.max_length = max_length + 256
 
     def __len__(self) -> int:
@@ -65,42 +64,57 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
         image = grid_to_image(task.input_grid.values)
         text_grid = serialize_task_for_teacher(task)
 
-        # Manual Prompt with the <image> placeholder for Gemma-4 expansion
+        # MANUAL OVERRIDE: The AutoProcessor for Gemma-4 MoE currently fails to auto-expand
+        # the <image> token. We manually inject 256 <image> tokens to match the ViT features.
+        image_tokens = "<image>" * 256
+        
         prompt = (
-            f"<image>\n"
+            f"User:\n{image_tokens}\n"
             f"ARC Grid:\n{text_grid}\n"
             f"Identify the transformation rule and predict the next drone action index (0-7) and halting step (1-6).\n"
-            f"Answer: "
+            f"Assistant: "
         )
 
         action_idx = action_to_index(task.target_action)
         halt_step = halt_probability_to_step(halt_probability=task.target_action.halt_probability, refinement_steps=6)
         answer = f"Action: {action_idx}, Halt: {halt_step}"
 
-        # Combine for full input
-        full_text = prompt + answer + self.processor.tokenizer.eos_token
-
-        # Use the processor to handle both image and text simultaneously
-        # It will automatically find <image> and replace it with 256 tokens.
-        inputs = self.processor(
-            text=full_text,
-            images=image,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True
-        )
+        # We must use processor as a callable if it supports vision
+        # If processor is actually just a tokenizer (due to HF bug), it will ignore `images` kwarg safely
+        try:
+            inputs = self.processor(
+                text=prompt + answer + self.processor.tokenizer.eos_token,
+                images=image,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=self.max_length,
+                truncation=True
+            )
+        except TypeError:
+            # Fallback if AutoProcessor returned ONLY a tokenizer
+            inputs = self.processor(
+                text=prompt + answer + self.processor.eos_token,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=self.max_length,
+                truncation=True
+            )
+            # The model will fail without pixel_values if it's truly multimodal, 
+            # so we must assume an external image processor is missing.
+            raise RuntimeError("AutoProcessor returned a basic tokenizer instead of a multimodal processor. Ensure transformers is up to date.")
 
         payload = {k: v.squeeze(0) for k, v in inputs.items()}
 
-        # Masking labels for the prompt part
-        # We re-process ONLY the prompt to find its length after expansion
-        prompt_inputs = self.processor(
-            text=prompt,
-            images=image,
-            return_tensors="pt"
-        )
-        prompt_len = prompt_inputs.input_ids.shape[1]
+        try:
+            prompt_inputs = self.processor(
+                text=prompt,
+                images=image,
+                return_tensors="pt"
+            )
+            prompt_len = prompt_inputs.input_ids.shape[1]
+        except TypeError:
+            prompt_inputs = self.processor(text=prompt, return_tensors="pt")
+            prompt_len = prompt_inputs.input_ids.shape[1]
 
         labels = payload["input_ids"].clone()
         labels[:prompt_len] = -100
@@ -155,20 +169,14 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         trust_remote_code=True,
     )
     
-    # --- MANUAL PEFT PREPARATION ---
     print("Preparing model for training (BFloat16 mode)...")
     model.gradient_checkpointing_enable()
     
-    # Freeze all base parameters
     for param in model.parameters():
         param.requires_grad = False
-        
-    # Cast LM head or float32 anomalies to bfloat16
-    for param in model.parameters():
         if param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
 
-    # Use the official PEFT shortcut "all-linear" to auto-discover all MoE layers 
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
@@ -179,7 +187,6 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
     
     model = get_peft_model(model, lora_config)
     
-    # Ensure newly injected LoRA parameters are also bfloat16
     for name, param in model.named_parameters():
         if "lora" in name:
             param.data = param.data.to(torch.bfloat16)
@@ -211,7 +218,6 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs} [Train]")
         for batch_idx, batch in enumerate(pbar):
-            # Move all batch dict items to device
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             if "pixel_values" in batch:
                 batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
@@ -250,7 +256,6 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
 
         avg_train_loss = total_train_loss / len(train_loader)
         
-        # --- Evaluation ---
         model.eval()
         total_eval_loss = 0.0
         with torch.no_grad():
