@@ -15,6 +15,7 @@ class TRMReasonerOutput:
     """Outputs produced by the recursive reasoner."""
 
     action_logits: Tensor
+    halt_logits: Tensor
     halt_probabilities: Tensor
     hidden_states: list[Tensor]
     halted_at_step: Tensor
@@ -54,6 +55,7 @@ class TRMReasoner(nn.Module):
         state = self.encoder(flattened)
 
         hidden_states: list[Tensor] = [state]
+        halt_logits: list[Tensor] = []
         halt_probabilities: list[Tensor] = []
         halted_at_step = torch.full(
             (batch_size,),
@@ -65,7 +67,9 @@ class TRMReasoner(nn.Module):
 
         for step in range(1, self.config.refinement_steps + 1):
             state = self.refiner(state, hidden_states[-1])
-            halt_probability = torch.sigmoid(self.halting_head(state)).squeeze(-1)
+            halt_logit = self.halting_head(state).squeeze(-1)
+            halt_probability = torch.sigmoid(halt_logit)
+            halt_logits.append(halt_logit)
             halt_probabilities.append(halt_probability)
             hidden_states.append(state)
 
@@ -73,12 +77,10 @@ class TRMReasoner(nn.Module):
             halted_at_step = torch.where(new_halts, torch.full_like(halted_at_step, step), halted_at_step)
             has_halted = has_halted | new_halts
 
-            if bool(torch.all(has_halted)):
-                break
-
         action_logits = self.action_head(hidden_states[-1])
         return TRMReasonerOutput(
             action_logits=action_logits,
+            halt_logits=torch.stack(halt_logits, dim=1),
             halt_probabilities=torch.stack(halt_probabilities, dim=1),
             hidden_states=hidden_states,
             halted_at_step=halted_at_step,

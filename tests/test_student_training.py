@@ -19,7 +19,7 @@ def test_action_targets_map_to_student_vocabulary() -> None:
 
     indices = {action_to_index(task.target_action) for task in tasks}
 
-    assert indices <= set(range(8))
+    assert indices == {0, 2, 4, 6}
 
 
 def test_halt_targets_become_monotonic_after_target_step() -> None:
@@ -28,7 +28,7 @@ def test_halt_targets_become_monotonic_after_target_step() -> None:
 
     assert targets.shape == (6,)
     assert float(targets[halt_step - 1]) == 1.0
-    assert float(targets[-1]) == 1.0
+    assert float(targets.sum()) == 1.0
     assert float(targets[0]) in (0.0, 1.0)
 
 

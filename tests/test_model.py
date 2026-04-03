@@ -18,9 +18,10 @@ model = TRMReasoner(config)
 grid = torch.randint(0, 10, (2, 8, 8), dtype=torch.long)
 output = model(grid)
 assert output.action_logits.shape == (2, config.action_dim)
+assert output.halt_logits.shape == (2, config.refinement_steps)
 assert output.halt_probabilities.ndim == 2
 assert output.halt_probabilities.shape[0] == 2
-assert output.halt_probabilities.shape[1] <= config.refinement_steps
+assert output.halt_probabilities.shape[1] == config.refinement_steps
 assert torch.all(output.halted_at_step >= 1)
 """
     result = subprocess.run(
