@@ -37,10 +37,10 @@ class TeacherMoEFinetuneConfig:
     task_count: int = 25000
     eval_task_count: int = 1000
     batch_size: int = 1
-    gradient_accumulation_steps: int = 16  # Increased for stability with large model
+    gradient_accumulation_steps: int = 16
     epochs: int = 2
-    learning_rate: float = 5e-5  # Lower LR for large MoE
-    lora_r: int = 8  # Reduced rank to save memory
+    learning_rate: float = 5e-5
+    lora_r: int = 8
     lora_alpha: int = 16
     seed: int = 7
     output_dir: str = "artifacts/teacher_lora/gemma_26b_moe_arc_specialist"
@@ -49,7 +49,6 @@ class TeacherMoEFinetuneConfig:
 
 
 def _parse_metrics_from_text(text: str) -> tuple[int | None, int | None]:
-    """Extracts Action and Halt from Gemma's response text."""
     try:
         action_match = re.search(r"Action:\s*(\d+)", text)
         halt_match = re.search(r"Halt:\s*(\d+)", text)
@@ -90,32 +89,35 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",  # Critical for A100
+        attn_implementation="flash_attention_2",
         trust_remote_code=True,
     )
     
-    # --- MANUAL PEFT PREPARATION (Avoids the float32 cast that causes OOM) ---
+    # --- MANUAL PEFT PREPARATION ---
     print("Preparing model for training (BFloat16 mode)...")
     model.gradient_checkpointing_enable()
     
-    # We only cast the language model output and input embeddings to bfloat16
-    # Standard PEFT casts them to float32, which is what killed your 80GB VRAM.
-    for name, param in model.named_parameters():
-        if param.requires_grad:
+    # Freeze all base parameters
+    for param in model.parameters():
+        param.requires_grad = False
+        
+    # Cast LM head or float32 anomalies to bfloat16
+    for param in model.parameters():
+        if param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
 
+    # Use regex to bypass custom layers recognition issues in PEFT
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
-        # Targeting only essential modules to keep memory low
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=[".*q_proj.*linear", ".*k_proj.*linear", ".*v_proj.*linear", ".*o_proj.*linear"],
         bias="none",
         task_type="CAUSAL_LM"
     )
     
     model = get_peft_model(model, lora_config)
     
-    # Ensure all LoRA parameters are also bfloat16
+    # Ensure LoRA weights didn't default to fp32
     for name, param in model.named_parameters():
         if "lora" in name:
             param.data = param.data.to(torch.bfloat16)
