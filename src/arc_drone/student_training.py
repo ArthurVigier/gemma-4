@@ -245,7 +245,8 @@ def compute_loss(
     output = model(grid)
     action_loss = F.cross_entropy(output.action_logits, action_index)
     halt_supervision = halt_targets[:, : output.halt_probabilities.shape[1]]
-    halt_loss = F.binary_cross_entropy(output.halt_probabilities, halt_supervision)
+    halt_logits = torch.logit(output.halt_probabilities.clamp(min=1e-6, max=1.0 - 1e-6))
+    halt_loss = F.binary_cross_entropy_with_logits(halt_logits, halt_supervision)
     total_loss = config.action_loss_weight * action_loss + config.halt_loss_weight * halt_loss
 
     action_accuracy = float((output.action_logits.argmax(dim=-1) == action_index).float().mean().item())
