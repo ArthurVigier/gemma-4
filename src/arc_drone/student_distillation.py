@@ -11,6 +11,12 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency in lighter envs
+    def tqdm(iterable=None, *args, **kwargs):  # type: ignore[no-redef]
+        return iterable
+
 from .arc_drone_bench import ARCDroneBench
 from .config import BenchmarkConfig, DeploymentConfig, ReasonerConfig
 from .export_tensorrt import build_trtexec_command, export_reasoner_model_to_onnx
@@ -154,9 +160,9 @@ def _fit_teacher_probe(
     dataset = TensorDataset(teacher_features, action_indices, halt_steps)
     loader = DataLoader(dataset, batch_size=probe_batch_size, shuffle=True)
 
-    for _ in range(probe_epochs):
+    for _ in tqdm(range(1, probe_epochs + 1), desc="teacher probe", leave=False):
         probe.train()
-        for features, actions, halts in loader:
+        for features, actions, halts in tqdm(loader, desc="teacher probe batches", leave=False):
             optimizer.zero_grad(set_to_none=True)
             features = features.to(device=device, dtype=torch.float32)
             actions = actions.to(device)
@@ -180,7 +186,7 @@ def _project_teacher_logits(
     action_logits_batches: list[torch.Tensor] = []
     halt_logits_batches: list[torch.Tensor] = []
     with torch.no_grad():
-        for features in loader:
+        for features in tqdm(loader, desc="teacher logits", leave=False):
             features = features.to(device=device, dtype=torch.float32)
             action_logits, halt_logits = probe(features)
             action_logits_batches.append(action_logits.cpu())
@@ -248,6 +254,7 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
     train_base = ArcStudentDataset(train_tasks, reasoner_config)
     eval_base = ArcStudentDataset(eval_tasks, reasoner_config)
 
+    print("Building teacher features for train split...")
     train_features_by_layer, _, _, hidden_layer_count = build_teacher_features(
         tasks=train_tasks,
         foundation_model_id=config.foundation_model_id,
@@ -255,6 +262,7 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
         max_length=config.teacher_max_length,
         device=device,
     )
+    print("Building teacher features for eval split...")
     eval_features_by_layer, _, _, _ = build_teacher_features(
         tasks=eval_tasks,
         foundation_model_id=config.foundation_model_id,
@@ -276,6 +284,7 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
 
     train_action_indices = torch.stack([train_base[index]["action_index"] for index in range(len(train_base))])
     train_halt_steps = torch.stack([train_base[index]["halt_step"] for index in range(len(train_base))])
+    print("Fitting teacher probe...")
     teacher_probe = _fit_teacher_probe(
         teacher_features=combined_train_features,
         action_indices=train_action_indices,
@@ -286,11 +295,13 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
         probe_learning_rate=config.teacher_probe_learning_rate,
         refinement_steps=config.refinement_steps,
     )
+    print("Projecting teacher logits for train split...")
     train_teacher_action_logits, train_teacher_halt_logits = _project_teacher_logits(
         probe=teacher_probe,
         teacher_features=combined_train_features,
         device=device,
     )
+    print("Projecting teacher logits for eval split...")
     eval_teacher_action_logits, eval_teacher_halt_logits = _project_teacher_logits(
         probe=teacher_probe,
         teacher_features=combined_eval_features,
@@ -436,7 +447,11 @@ def _run_epoch(
     total_halt_step_mae = 0.0
     batch_count = 0
 
-    for batch in loader:
+    for batch in tqdm(
+        loader,
+        desc="train distill" if training else "eval distill",
+        leave=False,
+    ):
         batch_count += 1
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -504,7 +519,7 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
     best_eval_halt_step_mae = float("inf")
     best_checkpoint_path = output_dir / "best_student.pt"
 
-    for epoch in range(1, config.epochs + 1):
+    for epoch in tqdm(range(1, config.epochs + 1), desc="distill epochs"):
         train_metrics = _run_epoch(
             model=model,
             loader=train_loader,

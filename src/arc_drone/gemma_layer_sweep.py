@@ -15,6 +15,12 @@ from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - optional dependency in lighter envs
+    def tqdm(iterable=None, *args, **kwargs):  # type: ignore[no-redef]
+        return iterable
+
 from .arc_drone_bench import ARCDroneBench
 from .config import BenchmarkConfig
 from .student_training import ACTION_VOCABULARY, halt_probability_to_step
@@ -203,8 +209,13 @@ def build_teacher_features(
     feature_batches: dict[int, list[torch.Tensor]] = {layer: [] for layer in layers}
     batch_size = 8
     hidden_layer_count = -1
+    batch_starts = range(0, len(prompts), batch_size)
     with torch.no_grad():
-        for start in range(0, len(prompts), batch_size):
+        for start in tqdm(
+            batch_starts,
+            desc="teacher features",
+            total=len(range(0, len(prompts), batch_size)),
+        ):
             batch_prompts = prompts[start : start + batch_size]
             encoded = tokenizer(
                 batch_prompts,
@@ -265,7 +276,11 @@ def _run_probe_epoch(
     total_halt_step_mae = 0.0
     batch_count = 0
 
-    for batch in loader:
+    for batch in tqdm(
+        loader,
+        desc=f"{'train' if training else 'eval'} probe l{layer_index}",
+        leave=False,
+    ):
         batch_count += 1
         features = batch[f"layer_{layer_index}"].to(device=device, dtype=torch.float32)
         action_index = batch["action_index"].to(device)
@@ -351,7 +366,11 @@ def run_layer_sweep(config: LayerSweepConfig) -> LayerSweepSummary:
         optimizer = torch.optim.AdamW(probe.parameters(), lr=config.probe_learning_rate)
         train_metrics = {"action_accuracy": 0.0, "halt_step_mae": 0.0}
         eval_metrics = {"action_accuracy": 0.0, "halt_step_mae": 0.0}
-        for _ in range(config.probe_epochs):
+        for _ in tqdm(
+            range(1, config.probe_epochs + 1),
+            desc=f"layer {layer_index}",
+            leave=False,
+        ):
             train_metrics = _run_probe_epoch(
                 probe=probe,
                 loader=train_loader,
