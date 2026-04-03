@@ -54,8 +54,13 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
     def __init__(self, tasks: list[Any], processor: Any, max_length: int) -> None:
         self.tasks = tasks
         self.processor = processor
-        # Increase max_length significantly because 256 tokens are reserved for the image alone
-        self.max_length = max_length + 256
+        image_seq_length = getattr(processor, "image_seq_length", 280)
+        try:
+            self.image_seq_length = int(image_seq_length)
+        except (TypeError, ValueError):
+            self.image_seq_length = 280
+        # Reserve space for the processor's configured image token expansion.
+        self.max_length = max_length + self.image_seq_length
 
     def __len__(self) -> int:
         return len(self.tasks)
@@ -64,20 +69,25 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
         task = self.tasks[index]
         image = grid_to_image(task.input_grid.values)
         text_grid = serialize_task_for_teacher(task)
-
-        # MANUAL OVERRIDE: The AutoProcessor for Gemma-4 MoE currently fails to auto-expand
-        # the <image> token. We manually inject 256 <image> tokens to match the ViT features.
-        image_tokens = "<image>" * 256
-        
-        prompt = (
-            f"User:\n{image_tokens}\n"
-            f"{text_grid}\n"
-            f"Assistant: "
-        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": f"{text_grid}\nPredict the best drone action family and halting step."},
+                ],
+            }
+        ]
 
         action_idx = action_to_index(task.target_action)
         halt_step = halt_probability_to_step(halt_probability=task.target_action.halt_probability, refinement_steps=6)
         answer = f"Action: {action_idx}, Halt: {halt_step}"
+
+        prompt = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
         # Combine for full input
         full_text = prompt + answer + self.processor.tokenizer.eos_token
