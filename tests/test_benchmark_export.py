@@ -107,6 +107,7 @@ def test_episode_export_and_jsonl_writer_roundtrip(tmp_path) -> None:
         success=True,
         symbolic_success=True,
         waypoint_success=True,
+        waypoint_distance_m=0.12,
         termination_reason="success",
     )
 
@@ -118,6 +119,7 @@ def test_episode_export_and_jsonl_writer_roundtrip(tmp_path) -> None:
     assert decoded["success"] is True
     assert decoded["symbolic_success"] is True
     assert decoded["waypoint_success"] is True
+    assert decoded["waypoint_distance_m"] == 0.12
     assert decoded["termination_reason"] == "success"
     assert decoded["supervision"]["snapshot_count"] == 1
     assert decoded["within_budget"] is True

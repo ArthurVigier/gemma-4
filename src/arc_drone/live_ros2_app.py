@@ -12,6 +12,7 @@ except ImportError:  # pragma: no cover
 
 from .gazebo_px4_adapter import GazeboPx4AdapterConfig, GazeboPx4Topics
 from .live_benchmark import LiveBenchmarkConfig, LiveBenchmarkRunner
+from .mission_targets import MissionTargetSubscription, MissionTargetTracker, default_mission_target_subscriptions
 from .ros_node import ARCDroneNode
 
 
@@ -27,7 +28,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--benchmark-max-episode-steps", type=int, default=100)
     parser.add_argument("--benchmark-ready-timeout-steps", type=int, default=40)
     parser.add_argument("--benchmark-rotate-max-rows", type=int, default=1000)
+    parser.add_argument(
+        "--mission-marker-topic",
+        action="append",
+        default=[],
+        help="Mission marker binding in the form entity_name=/ros/topic/odometry. Repeat as needed.",
+    )
     return parser.parse_args()
+
+
+def parse_mission_marker_topics(values: list[str]) -> list[MissionTargetSubscription]:
+    """Parses CLI mission marker bindings."""
+
+    if not values:
+        return default_mission_target_subscriptions()
+
+    subscriptions: list[MissionTargetSubscription] = []
+    for value in values:
+        entity_name, separator, topic_name = value.partition("=")
+        if not separator or not entity_name or not topic_name:
+            raise ValueError(
+                f"Invalid mission marker mapping {value!r}. Expected entity_name=/ros/topic/odometry."
+            )
+        subscriptions.append(MissionTargetSubscription(entity_name=entity_name, topic_name=topic_name))
+    return subscriptions
 
 
 def main() -> None:
@@ -43,6 +67,8 @@ def main() -> None:
         topics=GazeboPx4Topics(image_topic=args.image_topic),
     )
     node = ARCDroneNode(name=args.node_name, adapter_config=adapter_config)
+    mission_target_tracker = MissionTargetTracker(subscriptions=parse_mission_marker_topics(args.mission_marker_topic))
+    mission_target_tracker.bind_ros_interfaces(node)
     benchmark_runner = LiveBenchmarkRunner(
         LiveBenchmarkConfig(
             output_path=args.benchmark_output_path,
@@ -50,7 +76,8 @@ def main() -> None:
             max_episode_steps=args.benchmark_max_episode_steps,
             ready_timeout_steps=args.benchmark_ready_timeout_steps,
             rotate_max_rows_per_file=args.benchmark_rotate_max_rows,
-        )
+        ),
+        mission_target_tracker=mission_target_tracker,
     )
     period_s = 1.0 / args.offboard_rate_hz
 

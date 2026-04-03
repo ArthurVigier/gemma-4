@@ -69,6 +69,7 @@ Default bridged topics:
 - Gazebo clock: `/world/default/clock` -> `/clock`
 - Gazebo image: `/camera` -> `/camera/image_raw`
 - Gazebo camera info: `/camera_info` -> `/camera/camera_info`
+- Gazebo mission marker odometry: `/model/arc_marker_*/odometry` -> `/arc_drone/mission_markers/arc_marker_*/odometry`
 
 These topics can be overridden at launch time if the PX4 vehicle model exposes different sensor names.
 
@@ -110,7 +111,7 @@ Live episode termination uses real control outcomes instead of a fixed step coun
 The success condition is now simulator-aware:
 
 - symbolic success requires exact ARC grid match plus correct action
-- physical success requires entering the task target waypoint/zone in PX4 NED coordinates
+- physical success requires entering the live Gazebo mission marker radius, using bridged marker/entity odometry instead of a synthetic task center
 - final success requires both, plus `ready_for_control` when configured
 
 ## Architecture Notes

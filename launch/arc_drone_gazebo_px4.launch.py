@@ -20,8 +20,16 @@ def generate_launch_description() -> LaunchDescription:
     gz_clock_topic = LaunchConfiguration("gz_clock_topic")
     gz_image_topic = LaunchConfiguration("gz_image_topic")
     gz_camera_info_topic = LaunchConfiguration("gz_camera_info_topic")
+    gz_symmetry_marker_topic = LaunchConfiguration("gz_symmetry_marker_topic")
+    gz_counting_marker_topic = LaunchConfiguration("gz_counting_marker_topic")
+    gz_composition_marker_topic = LaunchConfiguration("gz_composition_marker_topic")
+    gz_path_planning_marker_topic = LaunchConfiguration("gz_path_planning_marker_topic")
     ros_image_topic = LaunchConfiguration("ros_image_topic")
     ros_camera_info_topic = LaunchConfiguration("ros_camera_info_topic")
+    ros_symmetry_marker_topic = LaunchConfiguration("ros_symmetry_marker_topic")
+    ros_counting_marker_topic = LaunchConfiguration("ros_counting_marker_topic")
+    ros_composition_marker_topic = LaunchConfiguration("ros_composition_marker_topic")
+    ros_path_planning_marker_topic = LaunchConfiguration("ros_path_planning_marker_topic")
     offboard_rate_hz = LaunchConfiguration("offboard_rate_hz")
     uxrce_udp_port = LaunchConfiguration("uxrce_udp_port")
 
@@ -74,6 +82,46 @@ def generate_launch_description() -> LaunchDescription:
                 description="ROS camera_info topic bridged from Gazebo.",
             ),
             DeclareLaunchArgument(
+                "gz_symmetry_marker_topic",
+                default_value="/model/arc_marker_symmetry/odometry",
+                description="Gazebo odometry topic for the symmetry mission marker.",
+            ),
+            DeclareLaunchArgument(
+                "gz_counting_marker_topic",
+                default_value="/model/arc_marker_counting/odometry",
+                description="Gazebo odometry topic for the counting mission marker.",
+            ),
+            DeclareLaunchArgument(
+                "gz_composition_marker_topic",
+                default_value="/model/arc_marker_composition/odometry",
+                description="Gazebo odometry topic for the composition mission marker.",
+            ),
+            DeclareLaunchArgument(
+                "gz_path_planning_marker_topic",
+                default_value="/model/arc_marker_path_planning/odometry",
+                description="Gazebo odometry topic for the path-planning mission marker.",
+            ),
+            DeclareLaunchArgument(
+                "ros_symmetry_marker_topic",
+                default_value="/arc_drone/mission_markers/arc_marker_symmetry/odometry",
+                description="ROS odometry topic for the symmetry mission marker.",
+            ),
+            DeclareLaunchArgument(
+                "ros_counting_marker_topic",
+                default_value="/arc_drone/mission_markers/arc_marker_counting/odometry",
+                description="ROS odometry topic for the counting mission marker.",
+            ),
+            DeclareLaunchArgument(
+                "ros_composition_marker_topic",
+                default_value="/arc_drone/mission_markers/arc_marker_composition/odometry",
+                description="ROS odometry topic for the composition mission marker.",
+            ),
+            DeclareLaunchArgument(
+                "ros_path_planning_marker_topic",
+                default_value="/arc_drone/mission_markers/arc_marker_path_planning/odometry",
+                description="ROS odometry topic for the path-planning mission marker.",
+            ),
+            DeclareLaunchArgument(
                 "offboard_rate_hz",
                 default_value="20.0",
                 description="Control loop frequency for the ARC-drone ROS 2 node.",
@@ -107,6 +155,10 @@ def generate_launch_description() -> LaunchDescription:
                             [gz_clock_topic, "@rosgraph_msgs/msg/Clock[gz.msgs.Clock"],
                             [gz_image_topic, "@sensor_msgs/msg/Image[gz.msgs.Image"],
                             [gz_camera_info_topic, "@sensor_msgs/msg/CameraInfo[gz.msgs.CameraInfo"],
+                            [gz_symmetry_marker_topic, "@nav_msgs/msg/Odometry[gz.msgs.Odometry"],
+                            [gz_counting_marker_topic, "@nav_msgs/msg/Odometry[gz.msgs.Odometry"],
+                            [gz_composition_marker_topic, "@nav_msgs/msg/Odometry[gz.msgs.Odometry"],
+                            [gz_path_planning_marker_topic, "@nav_msgs/msg/Odometry[gz.msgs.Odometry"],
                             "--ros-args",
                             "--remap",
                             [gz_clock_topic, ":=", "/clock"],
@@ -114,6 +166,14 @@ def generate_launch_description() -> LaunchDescription:
                             [gz_image_topic, ":=", ros_image_topic],
                             "--remap",
                             [gz_camera_info_topic, ":=", ros_camera_info_topic],
+                            "--remap",
+                            [gz_symmetry_marker_topic, ":=", ros_symmetry_marker_topic],
+                            "--remap",
+                            [gz_counting_marker_topic, ":=", ros_counting_marker_topic],
+                            "--remap",
+                            [gz_composition_marker_topic, ":=", ros_composition_marker_topic],
+                            "--remap",
+                            [gz_path_planning_marker_topic, ":=", ros_path_planning_marker_topic],
                         ],
                     )
                 ],
@@ -130,6 +190,14 @@ def generate_launch_description() -> LaunchDescription:
                             ros_image_topic,
                             "--offboard-rate-hz",
                             offboard_rate_hz,
+                            "--mission-marker-topic",
+                            ["arc_marker_symmetry=", ros_symmetry_marker_topic],
+                            "--mission-marker-topic",
+                            ["arc_marker_counting=", ros_counting_marker_topic],
+                            "--mission-marker-topic",
+                            ["arc_marker_composition=", ros_composition_marker_topic],
+                            "--mission-marker-topic",
+                            ["arc_marker_path_planning=", ros_path_planning_marker_topic],
                         ],
                         cwd=repo_root.as_posix(),
                         additional_env={"PYTHONPATH": pythonpath},

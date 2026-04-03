@@ -36,10 +36,12 @@ class BenchmarkEpisodeExport:
 
     task_id: str
     task_family: str
+    target_entity_name: str | None
     episode_steps: int
     success: bool
     symbolic_success: bool
     waypoint_success: bool
+    waypoint_distance_m: float | None
     termination_reason: str
     grid_accuracy: float
     action_accuracy: float
@@ -137,6 +139,7 @@ class BenchmarkSupervisionExporter:
         success: bool,
         symbolic_success: bool,
         waypoint_success: bool,
+        waypoint_distance_m: float | None,
         termination_reason: str,
     ) -> BenchmarkEpisodeExport:
         """Builds the export row for one benchmark episode."""
@@ -144,10 +147,12 @@ class BenchmarkSupervisionExporter:
         return BenchmarkEpisodeExport(
             task_id=task.task_id,
             task_family=task.family,
+            target_entity_name=task.target_entity_name,
             episode_steps=episode_steps,
             success=success,
             symbolic_success=symbolic_success,
             waypoint_success=waypoint_success,
+            waypoint_distance_m=waypoint_distance_m,
             termination_reason=termination_reason,
             grid_accuracy=benchmark_metrics.grid_accuracy,
             action_accuracy=benchmark_metrics.action_accuracy,

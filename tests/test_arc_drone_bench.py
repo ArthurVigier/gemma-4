@@ -15,3 +15,4 @@ def test_path_planning_task_contains_exit_marker() -> None:
     task = next(item for item in bench.generate_tasks() if item.family == "path_planning")
 
     assert 4 in task.target_grid.values
+    assert task.target_entity_name == "arc_marker_path_planning"

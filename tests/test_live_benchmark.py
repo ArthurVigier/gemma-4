@@ -58,6 +58,12 @@ def test_live_benchmark_runner_writes_episode_jsonl(tmp_path) -> None:
     record = _InferenceRecord()
     record.action = runner.current_task.target_action
     record.predicted_grid = runner.current_task.target_grid
+    expected_target_entity_name = runner.current_task.target_entity_name
+    runner.mission_target_tracker.update_target_position_ned(
+        entity_name=expected_target_entity_name,
+        position_ned=(2.2, -0.3, -1.7),
+        source_topic="/arc_drone/mission_markers/test",
+    )
     event = ControlEvent(
         event_type="offboard_state_changed",
         severity="info",
@@ -74,7 +80,7 @@ def test_live_benchmark_runner_writes_episode_jsonl(tmp_path) -> None:
     row0 = runner.record_tick(inference_record=record, snapshot=_snapshot(False, 1_000), events=[], latency_ms=25.0)
     row1 = runner.record_tick(
         inference_record=record,
-        snapshot=_snapshot_at_position(True, 2_000, runner.current_task.target_zone.center_ned),
+        snapshot=_snapshot_at_position(True, 2_000, (2.2, -0.3, -1.7)),
         events=[event],
         latency_ms=35.0,
     )
@@ -84,6 +90,8 @@ def test_live_benchmark_runner_writes_episode_jsonl(tmp_path) -> None:
     assert row1.success is True
     assert row1.symbolic_success is True
     assert row1.waypoint_success is True
+    assert row1.target_entity_name == expected_target_entity_name
+    assert row1.waypoint_distance_m == 0.0
     assert row1.termination_reason == "success"
     assert row1.supervision.snapshot_count == 2
     assert row1.supervision.time_to_ready_ms == 1.0
@@ -187,6 +195,11 @@ def test_live_benchmark_runner_requires_waypoint_hit_for_success(tmp_path) -> No
     record = _InferenceRecord()
     record.action = runner.current_task.target_action
     record.predicted_grid = runner.current_task.target_grid
+    runner.mission_target_tracker.update_target_position_ned(
+        entity_name=runner.current_task.target_entity_name,
+        position_ned=(1.0, 1.0, -1.0),
+        source_topic="/arc_drone/mission_markers/test",
+    )
 
     row0 = runner.record_tick(
         inference_record=record,

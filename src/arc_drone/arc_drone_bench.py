@@ -9,6 +9,7 @@ import numpy as np
 from .arc_types import ArcGrid, BenchmarkMetrics, BenchmarkTask, DroneAction, TargetZone
 from .config import BenchmarkConfig
 from .metrics import package_metrics
+from .mission_targets import default_target_entity_name
 
 
 @dataclass(slots=True)
@@ -65,6 +66,7 @@ class ARCDroneBench:
             target_grid=target,
             action=DroneAction((0.0, 0.4, 0.0), yaw_rate=0.2, halt_probability=0.95),
             target_zone=TargetZone(center_ned=(0.0, 1.2, -1.5), radius_m=0.45),
+            target_entity_name=default_target_entity_name("symmetry"),
             metadata={"transform": "mirror_x"},
         )
 
@@ -80,6 +82,7 @@ class ARCDroneBench:
             target_grid=target,
             action=DroneAction((0.2, 0.0, 0.0), yaw_rate=0.0, halt_probability=min(0.99, 0.5 + count / 200.0)),
             target_zone=TargetZone(center_ned=(1.0, 0.0, -1.2), radius_m=0.4),
+            target_entity_name=default_target_entity_name("counting"),
             metadata={"count_color": highlighted_color, "count": count},
         )
 
@@ -94,6 +97,7 @@ class ARCDroneBench:
             target_grid=target,
             action=DroneAction((0.0, 0.0, 0.3), yaw_rate=-0.1, halt_probability=0.88),
             target_zone=TargetZone(center_ned=(0.0, 0.0, -2.0), radius_m=0.35),
+            target_entity_name=default_target_entity_name("composition"),
             metadata={"transform": "rotate_plus_merge"},
         )
 
@@ -112,6 +116,7 @@ class ARCDroneBench:
             target_grid=target,
             action=DroneAction((0.3, 0.0, 0.0), yaw_rate=0.0, halt_probability=0.9),
             target_zone=TargetZone(center_ned=(1.8, 0.0, -1.5), radius_m=0.4),
+            target_entity_name=default_target_entity_name("path_planning"),
             metadata={"opening_row": opening},
         )
 
@@ -123,6 +128,7 @@ class ARCDroneBench:
         target_grid: np.ndarray,
         action: DroneAction,
         target_zone: TargetZone,
+        target_entity_name: str | None,
         metadata: dict[str, str | int | float],
     ) -> BenchmarkTask:
         return BenchmarkTask(
@@ -132,6 +138,7 @@ class ARCDroneBench:
             target_grid=ArcGrid(target_grid.astype(np.int64)),
             target_action=action,
             target_zone=target_zone,
+            target_entity_name=target_entity_name,
             metadata=metadata,
         )
 

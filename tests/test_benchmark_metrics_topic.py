@@ -53,6 +53,7 @@ def test_benchmark_episode_to_json_serializes_episode_payload() -> None:
         success=False,
         symbolic_success=False,
         waypoint_success=True,
+        waypoint_distance_m=0.4,
         termination_reason="max_steps_guard",
     )
 
@@ -62,5 +63,6 @@ def test_benchmark_episode_to_json_serializes_episode_payload() -> None:
     assert decoded["task_id"] == "path_planning-0000"
     assert decoded["latency_ms"] == 35.0
     assert decoded["waypoint_success"] is True
+    assert decoded["waypoint_distance_m"] == 0.4
     assert decoded["termination_reason"] == "max_steps_guard"
     assert decoded["supervision"]["snapshot_count"] == 1

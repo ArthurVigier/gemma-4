@@ -31,7 +31,11 @@ class DroneAction:
 
 @dataclass(slots=True)
 class TargetZone:
-    """Target zone expressed in PX4 NED coordinates."""
+    """Completion tolerance around a mission target expressed in PX4 NED coordinates.
+
+    `center_ned` remains as a nominal/debug reference, but live success should
+    come from the tracked Gazebo mission marker or world entity when available.
+    """
 
     center_ned: tuple[float, float, float]
     radius_m: float
@@ -47,6 +51,7 @@ class BenchmarkTask:
     target_grid: ArcGrid
     target_action: DroneAction
     target_zone: TargetZone | None = None
+    target_entity_name: str | None = None
     metadata: dict[str, str | int | float] = field(default_factory=dict)
 
 

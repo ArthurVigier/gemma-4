@@ -10,6 +10,7 @@ from pathlib import Path
 from .arc_drone_bench import ARCDroneBench
 from .benchmark_export import BenchmarkEpisodeExport, BenchmarkSupervisionExporter
 from .config import BenchmarkConfig
+from .mission_targets import MissionTargetTracker
 from .supervision import ControlEvent, ControlStateSnapshot
 
 
@@ -42,6 +43,7 @@ class _LiveEpisodeState:
     ready_seen: bool = False
     offboard_seen: bool = False
     waypoint_seen: bool = False
+    closest_waypoint_distance_m: float | None = None
 
 
 @dataclass(slots=True)
@@ -50,6 +52,7 @@ class LiveBenchmarkRunner:
 
     config: LiveBenchmarkConfig = field(default_factory=LiveBenchmarkConfig)
     benchmark_config: BenchmarkConfig = field(default_factory=BenchmarkConfig)
+    mission_target_tracker: MissionTargetTracker = field(default_factory=MissionTargetTracker)
     bench: ARCDroneBench = field(init=False)
     tasks: list = field(init=False)
     exporter: BenchmarkSupervisionExporter = field(init=False)
@@ -102,9 +105,22 @@ class LiveBenchmarkRunner:
         if snapshot is not None:
             self._episode.ready_seen = self._episode.ready_seen or snapshot.ready_for_control
             self._episode.offboard_seen = self._episode.offboard_seen or snapshot.offboard_enabled
+            waypoint_distance_m = self._waypoint_distance_m(
+                task=self.current_task,
+                snapshot=snapshot,
+            )
+            if waypoint_distance_m is not None:
+                if self._episode.closest_waypoint_distance_m is None:
+                    self._episode.closest_waypoint_distance_m = waypoint_distance_m
+                else:
+                    self._episode.closest_waypoint_distance_m = min(
+                        self._episode.closest_waypoint_distance_m,
+                        waypoint_distance_m,
+                    )
             self._episode.waypoint_seen = self._episode.waypoint_seen or self._waypoint_success(
                 task=self.current_task,
                 snapshot=snapshot,
+                waypoint_distance_m=waypoint_distance_m,
             )
 
         task = self.current_task
@@ -134,6 +150,7 @@ class LiveBenchmarkRunner:
             success=success,
             symbolic_success=symbolic_success,
             waypoint_success=waypoint_success,
+            waypoint_distance_m=self._episode.closest_waypoint_distance_m,
             termination_reason=termination_reason,
         )
         if self.config.flush_every_episode:
@@ -233,14 +250,32 @@ class LiveBenchmarkRunner:
             return "max_steps_guard"
         return None
 
-    @staticmethod
-    def _waypoint_success(*, task, snapshot: ControlStateSnapshot) -> bool:
-        """Returns whether the vehicle reached the task target zone."""
+    def _waypoint_distance_m(
+        self,
+        *,
+        task,
+        snapshot: ControlStateSnapshot,
+    ) -> float | None:
+        """Returns the live distance from the drone to the tracked mission marker."""
 
-        if task.target_zone is None or snapshot.position_ned is None:
+        if task.target_entity_name is None or snapshot.position_ned is None:
+            return None
+        return self.mission_target_tracker.distance_to_target_ned(
+            entity_name=task.target_entity_name,
+            reference_position_ned=snapshot.position_ned,
+        )
+
+    @staticmethod
+    def _waypoint_success(
+        *,
+        task,
+        snapshot: ControlStateSnapshot,
+        waypoint_distance_m: float | None,
+    ) -> bool:
+        """Returns whether the vehicle reached the live mission marker tolerance."""
+
+        if task.target_zone is None or task.target_entity_name is None or snapshot.position_ned is None:
             return False
-        dx = float(snapshot.position_ned[0]) - float(task.target_zone.center_ned[0])
-        dy = float(snapshot.position_ned[1]) - float(task.target_zone.center_ned[1])
-        dz = float(snapshot.position_ned[2]) - float(task.target_zone.center_ned[2])
-        distance = math.sqrt(dx * dx + dy * dy + dz * dz)
-        return distance <= float(task.target_zone.radius_m)
+        if waypoint_distance_m is None:
+            return False
+        return waypoint_distance_m <= float(task.target_zone.radius_m)
