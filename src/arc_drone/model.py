@@ -21,35 +21,56 @@ class TRMReasonerOutput:
     halted_at_step: Tensor
 
 
-class SpatialEncoder(nn.Module):
-    """Preserves 2D topology of the ARC grid using convolutional layers."""
+class GridAttentionEncoder(nn.Module):
+    """Preserves 2D topology and captures global relations using self-attention."""
 
     def __init__(self, config: ReasonerConfig) -> None:
         super().__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv2d(config.hidden_size, config.hidden_size, kernel_size=3, padding=1),
+        self.hidden_size = config.hidden_size
+        
+        # Learned 2D Positional Embeddings
+        self.row_embed = nn.Parameter(torch.randn(config.grid_height, self.hidden_size) * 0.02)
+        self.col_embed = nn.Parameter(torch.randn(config.grid_width, self.hidden_size) * 0.02)
+        
+        # Self-Attention Layer (Global)
+        self.mha = nn.MultiheadAttention(
+            embed_dim=self.hidden_size,
+            num_heads=4,
+            batch_first=True,
+        )
+        
+        # Semantic projection
+        self.norm = nn.LayerNorm(self.hidden_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(self.hidden_size, self.hidden_size * 2),
             nn.GELU(),
-            nn.Conv2d(config.hidden_size, config.hidden_size, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(config.hidden_size, config.hidden_size, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Linear(config.hidden_size, config.hidden_size),
+            nn.Linear(self.hidden_size * 2, self.hidden_size),
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        # Input x is (batch, H, W, hidden_size)
-        # Conv2d expects (batch, C, H, W)
-        x = x.permute(0, 3, 1, 2)
-        return self.cnn(x)
+        # Input x: (batch, H, W, hidden_size)
+        batch, h, w, d = x.shape
+        
+        # Add 2D Positional Embeddings
+        x = x + self.row_embed.view(1, h, 1, d) + self.col_embed.view(1, 1, w, d)
+        
+        # Flatten grid to sequence: (batch, H*W, hidden_size)
+        flat_x = x.reshape(batch, h * w, d)
+        
+        # Global Self-Attention
+        attn_out, _ = self.mha(flat_x, flat_x, flat_x)
+        out = self.norm(flat_x + attn_out)
+        
+        # Apply MLP and Global Mean Pool to get the final "thought" vector
+        out = out + self.mlp(out)
+        return out.mean(dim=1)
 
 
 class TRMReasoner(nn.Module):
     """A compact recursive reasoner with adaptive halting.
 
-    This version uses a SpatialEncoder to better capture ARC-like 2D relations
-    from the symbolic grid.
+    This version uses a GridAttentionEncoder to capture global spatial relations
+    similar to how Gemma-4's transformer backbone operates.
     """
 
     def __init__(self, config: ReasonerConfig | None = None) -> None:
@@ -57,7 +78,7 @@ class TRMReasoner(nn.Module):
         self.config = config or ReasonerConfig()
 
         self.embedding = nn.Embedding(self.config.color_count, self.config.hidden_size)
-        self.encoder = SpatialEncoder(self.config)
+        self.encoder = GridAttentionEncoder(self.config)
         self.refiner = nn.GRUCell(self.config.hidden_size, self.config.hidden_size)
         self.halting_head = nn.Linear(self.config.hidden_size, 1)
         self.action_head = nn.Linear(self.config.hidden_size, self.config.action_dim)

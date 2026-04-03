@@ -510,7 +510,14 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
     eval_loader = DataLoader(eval_dataset, batch_size=config.batch_size, shuffle=False)
 
     teacher_hidden_size = int(cache_metadata["teacher_feature_dim"])
-    model = DistilledReasoner(reasoner_config=reasoner_config, teacher_hidden_size=teacher_hidden_size).to(device)
+    model = DistilledReasoner(reasoner_config=reasoner_config, teacher_hidden_size=teacher_hidden_size)
+    model = model.to(device)
+    
+    print(f"Distillation starting on device: {device}")
+    if device.type == "cuda":
+        print(f"GPU Model: {torch.cuda.get_device_name(0)}")
+        print(f"Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
 

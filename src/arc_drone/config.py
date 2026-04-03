@@ -19,7 +19,7 @@ class ReasonerConfig:
     grid_height: int = 30
     grid_width: int = 30
     color_count: int = 10
-    hidden_size: int = 128
+    hidden_size: int = 160
     refinement_steps: int = 6
     halting_threshold: float = 0.82
     action_dim: int = 8
