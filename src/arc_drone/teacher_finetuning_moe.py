@@ -25,9 +25,9 @@ except Exception:
 
 from .arc_drone_bench import ARCDroneBench
 from .config import BenchmarkConfig
-from .gemma_layer_sweep import _lazy_import_transformers
-from .student_training import select_device, set_seed
-from .teacher_finetuning import TeacherHybridDataset
+from .gemma_layer_sweep import _lazy_import_transformers, serialize_task_for_teacher
+from .student_training import action_to_index, halt_probability_to_step, select_device, set_seed
+from .teacher_finetuning import grid_to_image
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +46,58 @@ class TeacherMoEFinetuneConfig:
     output_dir: str = "artifacts/teacher_lora/gemma_26b_moe_arc_specialist"
     max_length: int = 1024
     log_sample_every: int = 50
+
+
+class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]]):
+    """Dataset providing ALL keys required by the Gemma-4 multimodal processor."""
+
+    def __init__(self, tasks: list[Any], processor: Any, max_length: int) -> None:
+        self.tasks = tasks
+        self.processor = processor
+        self.max_length = max_length
+
+    def __len__(self) -> int:
+        return len(self.tasks)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        task = self.tasks[index]
+        image = grid_to_image(task.input_grid.values)
+        
+        text_grid = serialize_task_for_teacher(task)
+        prompt = (
+            f"User:<image>\n"
+            f"{text_grid}\n"
+            f"Predict the best drone action family and halting step.\n"
+            f"Assistant:"
+        )
+        
+        action_idx = action_to_index(task.target_action)
+        halt_step = halt_probability_to_step(halt_probability=task.target_action.halt_probability, refinement_steps=6)
+        answer = f"Action: {action_idx}, Halt: {halt_step}{self.processor.tokenizer.eos_token}"
+
+        # Capture ALL keys (input_ids, attention_mask, pixel_values, pixel_position_ids, etc.)
+        inputs = self.processor(
+            text=prompt + answer,
+            images=image,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True
+        )
+
+        # Flatten batch dim for the dataloader
+        payload = {k: v.squeeze(0) for k, v in inputs.items()}
+
+        # Create labels: mask out the prompt
+        full_tokens = self.processor.tokenizer(prompt).input_ids
+        prompt_len = len(full_tokens)
+
+        labels = payload["input_ids"].clone()
+        labels[:prompt_len] = -100
+        labels[payload["attention_mask"] == 0] = -100
+        payload["labels"] = labels
+
+        return payload
 
 
 def _parse_metrics_from_text(text: str) -> tuple[int | None, int | None]:
@@ -93,21 +145,14 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         trust_remote_code=True,
     )
     
-    # --- MANUAL PEFT PREPARATION ---
     print("Preparing model for training (BFloat16 mode)...")
     model.gradient_checkpointing_enable()
     
-    # Freeze all base parameters
     for param in model.parameters():
         param.requires_grad = False
-        
-    # Cast LM head or float32 anomalies to bfloat16
-    for param in model.parameters():
         if param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
 
-    # Use the official PEFT shortcut "all-linear" to auto-discover all MoE layers 
-    # (q_proj, experts w1/w2/w3, routers, etc.)
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
@@ -118,7 +163,6 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
     
     model = get_peft_model(model, lora_config)
     
-    # Ensure LoRA weights didn't default to fp32
     for name, param in model.named_parameters():
         if "lora" in name:
             param.data = param.data.to(torch.bfloat16)
@@ -129,8 +173,8 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
     train_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed)).generate_tasks()
     eval_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1)).generate_tasks()
 
-    train_dataset = TeacherHybridDataset(train_tasks, processor, config.max_length)
-    eval_dataset = TeacherHybridDataset(eval_tasks, processor, config.max_length)
+    train_dataset = TeacherMoEHybridDataset(train_tasks, processor, config.max_length)
+    eval_dataset = TeacherMoEHybridDataset(eval_tasks, processor, config.max_length)
     
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
     eval_loader = DataLoader(eval_dataset, batch_size=config.batch_size, shuffle=False)
@@ -150,18 +194,13 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs} [Train]")
         for batch_idx, batch in enumerate(pbar):
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            pixel_values = batch["pixel_values"].to(device, dtype=torch.bfloat16)
-            labels = batch["labels"].to(device)
+            # Move ALL keys to device (important for multimodal position IDs)
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            # Pixel values must be bfloat16
+            if "pixel_values" in batch:
+                batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
             
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                labels=labels,
-                return_dict=True
-            )
+            outputs = model(**batch, return_dict=True)
             
             loss = outputs.loss / config.gradient_accumulation_steps
             loss.backward()
@@ -175,7 +214,7 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
             with torch.no_grad():
                 idx = 0
                 logits = outputs.logits[idx]
-                target_ids = labels[idx]
+                target_ids = batch["labels"][idx]
                 valid_mask = target_ids != -100
                 if valid_mask.any():
                     pred_ids = torch.argmax(logits, dim=-1)[valid_mask]
@@ -195,18 +234,14 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
 
         avg_train_loss = total_train_loss / len(train_loader)
         
-        # --- Evaluation ---
         model.eval()
         total_eval_loss = 0.0
         with torch.no_grad():
             for batch in tqdm(eval_loader, desc=f"Eval"):
-                outputs = model(
-                    input_ids=batch["input_ids"].to(device),
-                    attention_mask=batch["attention_mask"].to(device),
-                    pixel_values=batch["pixel_values"].to(device, dtype=torch.bfloat16),
-                    labels=batch["labels"].to(device),
-                    return_dict=True
-                )
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                if "pixel_values" in batch:
+                    batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
+                outputs = model(**batch, return_dict=True)
                 total_eval_loss += outputs.loss.item()
                 
         avg_eval_loss = total_eval_loss / len(eval_loader)
