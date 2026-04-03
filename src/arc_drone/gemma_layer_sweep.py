@@ -267,7 +267,7 @@ def _run_probe_epoch(
 
     for batch in loader:
         batch_count += 1
-        features = batch[f"layer_{layer_index}"].to(device)
+        features = batch[f"layer_{layer_index}"].to(device=device, dtype=torch.float32)
         action_index = batch["action_index"].to(device)
         halt_step = batch["halt_step"].to(device)
 
