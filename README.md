@@ -67,6 +67,29 @@ This command:
 
 For this stage, I recommend renting a GPU with at least 40 GB of VRAM, for example an A100 40/80GB on RunPod or Vast.ai.
 
+## Student Training CLI
+
+The repo now includes a runnable student-training command for the TRM-like model:
+
+```bash
+python3 scripts/train_trm_student.py \
+  --device cuda \
+  --task-count 4096 \
+  --eval-task-count 512 \
+  --batch-size 32 \
+  --epochs 5 \
+  --output-dir artifacts/checkpoints/trm_student_run1 \
+  --export-onnx
+```
+
+This command:
+
+- trains the current TRM-like student directly on `ARC-Drone-Bench`
+- writes epoch checkpoints and `training_summary.json`
+- optionally exports the trained student to ONNX and prints the next `trtexec` command
+
+This is the runnable student-training stage in the current scaffold. Teacher-assisted `Gemma-4 + Unsloth + PEFT + BitsAndBytes` distillation remains the next extension on top of this GPU-ready baseline.
+
 ## ROS2 / Gazebo / PX4 Bringup
 
 Example:

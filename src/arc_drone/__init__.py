@@ -21,5 +21,6 @@ __all__ = [
     "ros_node",
     "simulators",
     "stack_profiles",
+    "student_training",
     "supervision",
 ]

@@ -32,7 +32,24 @@ def export_reasoner_to_onnx(
 
     reasoner_config = config or ReasonerConfig()
     deployment_config = deployment or DeploymentConfig()
-    model = _OnnxReasonerWrapper(TRMReasoner(reasoner_config).eval()).eval()
+    model = TRMReasoner(reasoner_config).eval()
+    return export_reasoner_model_to_onnx(
+        model=model,
+        output_path=output_path,
+        deployment=deployment_config,
+    )
+
+
+def export_reasoner_model_to_onnx(
+    model: TRMReasoner,
+    output_path: str | Path,
+    deployment: DeploymentConfig | None = None,
+) -> Path:
+    """Exports a specific reasoner instance to ONNX."""
+
+    deployment_config = deployment or DeploymentConfig()
+    model = _OnnxReasonerWrapper(model.eval()).eval()
+    reasoner_config = model.model.config
     dummy = torch.zeros(
         1,
         reasoner_config.grid_height,
