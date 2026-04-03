@@ -33,7 +33,7 @@ from .teacher_finetuning import grid_to_image
 @dataclass(frozen=True, slots=True)
 class TeacherMoEFinetuneConfig:
     """Configuration optimized for the 26B-A4B Mixture-of-Experts model."""
-    foundation_model_id: str = "google/gemma-4-26b-a4b"
+    foundation_model_id: str = "google/gemma-4-26B-A4B-it"
     task_count: int = 25000
     eval_task_count: int = 1000
     batch_size: int = 1

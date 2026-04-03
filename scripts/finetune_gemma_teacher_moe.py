@@ -13,7 +13,7 @@ from arc_drone.teacher_finetuning_moe import TeacherMoEFinetuneConfig, finetune_
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fine-tune Gemma-4 MoE teacher model using QLoRA.")
-    parser.add_argument("--foundation-model-id", type=str, default="google/gemma-4-26b-a4b", help="HF model ID.")
+    parser.add_argument("--foundation-model-id", type=str, default="google/gemma-4-26B-A4B-it", help="HF model ID.")
     parser.add_argument("--task-count", type=int, default=25000, help="Number of training tasks.")
     parser.add_argument("--eval-task-count", type=int, default=1000, help="Number of evaluation tasks.")
     parser.add_argument("--batch-size", type=int, default=1, help="Training batch size (keep low for MoE).")
