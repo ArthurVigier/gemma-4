@@ -33,6 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--refinement-steps", type=int, default=6)
     parser.add_argument("--halting-threshold", type=float, default=0.82)
     parser.add_argument("--action-loss-weight", type=float, default=1.0)
+    parser.add_argument("--action-regression-weight", type=float, default=0.5)
     parser.add_argument("--halt-loss-weight", type=float, default=0.25)
     parser.add_argument("--num-workers", type=int, default=0)
     return parser.parse_args()
@@ -59,6 +60,7 @@ def main() -> int:
             refinement_steps=args.refinement_steps,
             halting_threshold=args.halting_threshold,
             action_loss_weight=args.action_loss_weight,
+            action_regression_weight=args.action_regression_weight,
             halt_loss_weight=args.halt_loss_weight,
             num_workers=args.num_workers,
         )

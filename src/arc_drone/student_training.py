@@ -56,6 +56,7 @@ class StudentTrainingConfig:
     refinement_steps: int = 6
     halting_threshold: float = 0.82
     action_loss_weight: float = 2.0
+    action_regression_weight: float = 0.5
     halt_loss_weight: float = 0.5
 
 
@@ -107,6 +108,7 @@ class ArcStudentDataset(Dataset[dict[str, torch.Tensor]]):
         return {
             "grid": torch.tensor(task.input_grid.values, dtype=torch.long),
             "action_index": torch.tensor(action_to_index(task.target_action), dtype=torch.long),
+            "action_target_vector": action_to_vector(task.target_action),
             "halt_targets": build_halt_targets(
                 halt_step=halt_step,
                 refinement_steps=self.reasoner_config.refinement_steps,
@@ -134,6 +136,22 @@ def action_to_index(action: DroneAction, atol: float = 1e-6) -> int:
         for candidate in ACTION_VOCABULARY
     ]
     return int(np.argmin(distances))
+
+
+def action_to_vector(action: DroneAction) -> torch.Tensor:
+    """Converts an action envelope to a dense control vector."""
+
+    return torch.tensor([*action.velocity_xyz, action.yaw_rate], dtype=torch.float32)
+
+
+def action_vocabulary_tensor(*, device: torch.device) -> torch.Tensor:
+    """Returns the action vocabulary as a dense tensor on the requested device."""
+
+    return torch.tensor(
+        [[*candidate.velocity_xyz, candidate.yaw_rate] for candidate in ACTION_VOCABULARY],
+        dtype=torch.float32,
+        device=device,
+    )
 
 
 def halt_probability_to_step(*, halt_probability: float, refinement_steps: int) -> int:
@@ -239,19 +257,28 @@ def compute_loss(
 
     grid = batch["grid"].to(device)
     action_index = batch["action_index"].to(device)
+    action_target_vector = batch["action_target_vector"].to(device)
     halt_targets = batch["halt_targets"].to(device)
     halt_step = batch["halt_step"].to(device)
 
     output = model(grid)
     action_loss = F.cross_entropy(output.action_logits, action_index)
+    action_probabilities = output.action_logits.softmax(dim=-1)
+    expected_action = action_probabilities @ action_vocabulary_tensor(device=device)
+    action_regression_loss = F.smooth_l1_loss(expected_action, action_target_vector)
     halt_supervision = halt_targets.argmax(dim=-1)
     halt_loss = F.cross_entropy(output.halt_logits, halt_supervision)
-    total_loss = config.action_loss_weight * action_loss + config.halt_loss_weight * halt_loss
+    total_loss = (
+        config.action_loss_weight * action_loss
+        + config.action_regression_weight * action_regression_loss
+        + config.halt_loss_weight * halt_loss
+    )
 
     action_accuracy = float((output.action_logits.argmax(dim=-1) == action_index).float().mean().item())
     halt_step_mae = float(torch.mean(torch.abs(output.halted_at_step.float() - halt_step.float())).item())
     return total_loss, {
         "action_loss": float(action_loss.item()),
+        "action_regression_loss": float(action_regression_loss.item()),
         "halt_loss": float(halt_loss.item()),
         "action_accuracy": action_accuracy,
         "halt_step_mae": halt_step_mae,

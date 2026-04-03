@@ -3,14 +3,18 @@ import sys
 from pathlib import Path
 
 import pytest
+import torch
 
 from arc_drone.arc_drone_bench import ARCDroneBench
 from arc_drone.config import BenchmarkConfig
 from arc_drone.student_training import (
     action_to_index,
+    action_to_vector,
+    action_vocabulary_tensor,
     build_halt_targets,
     halt_probability_to_step,
 )
+from arc_drone.arc_types import DroneAction
 
 
 def test_action_targets_map_to_student_vocabulary() -> None:
@@ -20,6 +24,17 @@ def test_action_targets_map_to_student_vocabulary() -> None:
     indices = {action_to_index(task.target_action) for task in tasks}
 
     assert indices == {0, 2, 4, 6}
+
+
+def test_action_vector_matches_vocabulary_shape() -> None:
+    action = DroneAction((0.3, 0.0, 0.0), 0.0, 0.5)
+
+    vector = action_to_vector(action)
+    vocabulary = action_vocabulary_tensor(device="cpu")
+
+    assert vector.shape == (4,)
+    assert vocabulary.shape == (8, 4)
+    assert torch.isclose(vector[0], torch.tensor(0.3))
 
 
 def test_halt_targets_become_monotonic_after_target_step() -> None:
