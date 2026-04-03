@@ -54,7 +54,7 @@ def grid_to_image(grid_values: np.ndarray, upscale: int = 10) -> Image.Image:
 
 @dataclass(frozen=True, slots=True)
 class TeacherFinetuneConfig:
-    foundation_model_id: str = "google/gemma-4-e4b"
+    foundation_model_id: str = "google/gemma-4-e2b-it"
     task_count: int = 25000
     eval_task_count: int = 1000
     batch_size: int = 4
@@ -72,7 +72,12 @@ class TeacherHybridDataset(Dataset[dict[str, torch.Tensor]]):
     def __init__(self, tasks: list[Any], processor: Any, max_length: int) -> None:
         self.tasks = tasks
         self.processor = processor
-        self.max_length = max_length
+        image_seq_length = getattr(processor, "image_seq_length", 280)
+        try:
+            self.image_seq_length = int(image_seq_length)
+        except (TypeError, ValueError):
+            self.image_seq_length = 280
+        self.max_length = max_length + self.image_seq_length
 
     def __len__(self) -> int:
         return len(self.tasks)
@@ -151,7 +156,7 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
     device = select_device("cuda")
 
     AutoModelForImageTextToText, AutoProcessor, AutoTokenizer = _lazy_import_transformers()
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from peft import LoraConfig, get_peft_model
     from transformers import BitsAndBytesConfig
 
     print(f"--- Fine-tuning Initialization ---")
@@ -161,7 +166,7 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
     print("\nLoading Multimodal Processor...")
     processor = AutoProcessor.from_pretrained(config.foundation_model_id, trust_remote_code=True)
     
-    print("Loading Gemma in 4-bit precision (QLoRA)...")
+    print("Loading Gemma in 4-bit precision (QLoRA, SDPA attention)...")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -172,20 +177,34 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
         config.foundation_model_id,
         quantization_config=bnb_config,
         device_map="auto",
+        torch_dtype=torch.bfloat16,
+        attn_implementation="sdpa",
         trust_remote_code=True,
     )
-    
-    model = prepare_model_for_kbit_training(model)
+
+    print("Preparing model for training (BFloat16 mode)...")
+    model.gradient_checkpointing_enable()
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    for param in model.parameters():
+        if param.dtype == torch.float32:
+            param.data = param.data.to(torch.bfloat16)
     
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        target_modules="all-linear",
         bias="none",
         task_type="CAUSAL_LM"
     )
     
     model = get_peft_model(model, lora_config)
+
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            param.data = param.data.to(torch.bfloat16)
     model.print_trainable_parameters()
 
     print("\nGenerating ARC-Drone tasks for fine-tuning...")
