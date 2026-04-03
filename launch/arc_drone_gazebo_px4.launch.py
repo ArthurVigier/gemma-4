@@ -17,6 +17,7 @@ def generate_launch_description() -> LaunchDescription:
     px4_autopilot_path = LaunchConfiguration("px4_autopilot_path")
     px4_make_target = LaunchConfiguration("px4_make_target")
     world_name = LaunchConfiguration("world_name")
+    world_file_path = LaunchConfiguration("world_file_path")
     gz_clock_topic = LaunchConfiguration("gz_clock_topic")
     gz_image_topic = LaunchConfiguration("gz_image_topic")
     gz_camera_info_topic = LaunchConfiguration("gz_camera_info_topic")
@@ -53,8 +54,13 @@ def generate_launch_description() -> LaunchDescription:
             ),
             DeclareLaunchArgument(
                 "world_name",
-                default_value="default",
+                default_value="arc_drone_bench_mission",
                 description="Gazebo world name used for the world clock topic.",
+            ),
+            DeclareLaunchArgument(
+                "world_file_path",
+                default_value=(repo_root / "assets" / "gazebo" / "worlds" / "arc_drone_bench_mission.world").as_posix(),
+                description="Absolute path to the Gazebo world file with mission markers.",
             ),
             DeclareLaunchArgument(
                 "gz_clock_topic",
@@ -139,7 +145,11 @@ def generate_launch_description() -> LaunchDescription:
             ExecuteProcess(
                 cmd=["make", "px4_sitl", px4_make_target],
                 cwd=px4_autopilot_path,
-                additional_env={"PX4_GZ_WORLD": world_name},
+                additional_env={
+                    "PX4_GZ_WORLD": world_name,
+                    "PX4_GZ_WORLD_FILE": world_file_path,
+                    "GZ_SIM_RESOURCE_PATH": f"{(repo_root / 'assets' / 'gazebo' / 'models').as_posix()}:{(repo_root / 'assets' / 'gazebo' / 'worlds').as_posix()}",
+                },
                 name="px4_gazebo_sitl",
                 output="screen",
             ),

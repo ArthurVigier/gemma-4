@@ -9,6 +9,7 @@ __all__ = [
     "arc_drone_bench",
     "benchmark_export",
     "bringup",
+    "cloud_gpu",
     "config",
     "export_tensorrt",
     "gazebo_px4_adapter",

@@ -43,11 +43,37 @@ python3 -m pip install -e '.[dev]'
 pytest
 ```
 
+## Cloud GPU Smoke Test
+
+On a cloud GPU VM with CUDA available:
+
+```bash
+python3 -m pip install -e '.[training]'
+python3 scripts/run_gpu_smoke.py --export-onnx
+```
+
+Or with the shell wrapper:
+
+```bash
+bash scripts/run_gpu_smoke.sh
+```
+
+This command:
+
+- checks that CUDA is available
+- runs one TRM-like forward pass on GPU
+- exports ONNX to `artifacts/onnx/trm_reasoner.onnx`
+- prints the next `trtexec` command for TensorRT engine generation
+
+For this stage, I recommend renting a GPU with at least 40 GB of VRAM, for example an A100 40/80GB on RunPod or Vast.ai.
+
 ## ROS2 / Gazebo / PX4 Bringup
 
 Example:
 
 ```bash
+python3 scripts/validate_gazebo_mission_world.py
+
 ros2 launch /path/to/gemma-4/launch/arc_drone_gazebo_px4.launch.py \
   px4_autopilot_path:=/path/to/PX4-Autopilot \
   px4_make_target:=gz_x500_depth
@@ -72,6 +98,13 @@ Default bridged topics:
 - Gazebo mission marker odometry: `/model/arc_marker_*/odometry` -> `/arc_drone/mission_markers/arc_marker_*/odometry`
 
 These topics can be overridden at launch time if the PX4 vehicle model exposes different sensor names.
+
+Local mission world assets are provided under:
+
+- `assets/gazebo/worlds/arc_drone_bench_mission.world`
+- `assets/gazebo/models/arc_marker_*`
+
+The validation helper checks that the world file contains all mission markers required by `ARC-Drone-Bench` before launch.
 
 ## Supervision Topics
 
