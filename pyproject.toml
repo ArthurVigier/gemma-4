@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arc-drone-bench"
+version = "0.1.0"
+description = "ARC-Drone-Bench scaffold for simulated drone reasoning with TRM-like recursive refinement."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "numpy>=1.26",
+  "torch>=2.5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+sim = [
+  "airsim>=1.8.1",
+]
+training = [
+  "transformers>=4.50",
+  "peft>=0.14",
+  "bitsandbytes>=0.45",
+  "onnx>=1.20",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
