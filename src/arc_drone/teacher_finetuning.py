@@ -176,8 +176,8 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
     model = AutoModelForImageTextToText.from_pretrained(
         config.foundation_model_id,
         quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
+        device_map={"": 0},
+        dtype=torch.bfloat16,
         attn_implementation="sdpa",
         trust_remote_code=True,
     )
