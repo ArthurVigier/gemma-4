@@ -55,13 +55,7 @@ def _load_teacher_components(*, foundation_model_id: str, device: torch.device) 
     ).to(device)
     teacher_model.eval()
 
-    language_backbone = getattr(teacher_model, "language_model", None)
-    if language_backbone is None:
-        raise RuntimeError(
-            f"{foundation_model_id} did not expose a `language_model` submodule; Gemma-4 hidden-state sweep expects the language backbone."
-        )
-    language_backbone.eval()
-    return tokenizer, language_backbone
+    return tokenizer, teacher_model
 
 
 def _extract_hidden_states(outputs: Any) -> tuple[Any, ...]:
@@ -188,7 +182,7 @@ def build_teacher_features(
     max_length: int,
     device: torch.device,
 ) -> tuple[dict[int, torch.Tensor], torch.Tensor, torch.Tensor, int]:
-    tokenizer, language_backbone = _load_teacher_components(
+    tokenizer, teacher_model = _load_teacher_components(
         foundation_model_id=foundation_model_id,
         device=device,
     )
@@ -219,7 +213,7 @@ def build_teacher_features(
                 max_length=max_length,
                 return_tensors="pt",
             ).to(device)
-            outputs = language_backbone(
+            outputs = teacher_model(
                 input_ids=encoded["input_ids"],
                 attention_mask=encoded["attention_mask"],
                 output_hidden_states=True,
