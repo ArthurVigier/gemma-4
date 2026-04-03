@@ -106,11 +106,12 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         if param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
 
-    # Use regex to bypass custom layers recognition issues in PEFT
+    # Use the official PEFT shortcut "all-linear" to auto-discover all MoE layers 
+    # (q_proj, experts w1/w2/w3, routers, etc.)
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
-        target_modules=[".*q_proj.*linear", ".*k_proj.*linear", ".*v_proj.*linear", ".*o_proj.*linear"],
+        target_modules="all-linear",
         bias="none",
         task_type="CAUSAL_LM"
     )
