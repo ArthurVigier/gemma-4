@@ -42,7 +42,6 @@ ARC_COLORS = [
 
 
 def grid_to_image(grid_values: np.ndarray, upscale: int = 10) -> Image.Image:
-    """Converts a symbolic ARC grid to a PIL image using official colors."""
     h, w = grid_values.shape
     img = Image.new("RGB", (w, h))
     for y in range(h):
@@ -55,7 +54,7 @@ def grid_to_image(grid_values: np.ndarray, upscale: int = 10) -> Image.Image:
 
 @dataclass(frozen=True, slots=True)
 class TeacherFinetuneConfig:
-    foundation_model_id: str = "google/gemma-4-e2b"
+    foundation_model_id: str = "google/gemma-4-e4b"
     task_count: int = 25000
     eval_task_count: int = 1000
     batch_size: int = 4
@@ -64,14 +63,12 @@ class TeacherFinetuneConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     seed: int = 7
-    output_dir: str = "artifacts/teacher_lora/gemma_e2b_arc_specialist"
+    output_dir: str = "artifacts/teacher_lora/gemma_e4b_arc_specialist"
     max_length: int = 1024
     log_sample_every: int = 250
 
 
 class TeacherHybridDataset(Dataset[dict[str, torch.Tensor]]):
-    """Hybrid SOTA dataset: Image (Visual) + Text Grid (Symbolic) -> Action Answer."""
-
     def __init__(self, tasks: list[Any], processor: Any, max_length: int) -> None:
         self.tasks = tasks
         self.processor = processor
@@ -83,22 +80,32 @@ class TeacherHybridDataset(Dataset[dict[str, torch.Tensor]]):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         task = self.tasks[index]
         image = grid_to_image(task.input_grid.values)
-        
         text_grid = serialize_task_for_teacher(task)
-        prompt = (
-            f"User:<image>\n"
-            f"{text_grid}\n"
-            f"Predict the best drone action family and halting step.\n"
-            f"Assistant:"
-        )
+        
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image"},
+                    {"type": "text", "text": f"{text_grid}\nPredict the best drone action family and halting step."}
+                ]
+            }
+        ]
         
         action_idx = action_to_index(task.target_action)
         halt_step = halt_probability_to_step(halt_probability=task.target_action.halt_probability, refinement_steps=6)
-        
-        answer = f"Action: {action_idx}, Halt: {halt_step}{self.processor.tokenizer.eos_token}"
+        answer = f"Action: {action_idx}, Halt: {halt_step}"
+
+        prompt = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+
+        full_text = prompt + answer + self.processor.tokenizer.eos_token
 
         inputs = self.processor(
-            text=prompt + answer,
+            text=full_text,
             images=image,
             return_tensors="pt",
             padding="max_length",
@@ -106,27 +113,27 @@ class TeacherHybridDataset(Dataset[dict[str, torch.Tensor]]):
             truncation=True
         )
 
-        input_ids = inputs["input_ids"].squeeze(0)
-        attention_mask = inputs["attention_mask"].squeeze(0)
-        pixel_values = inputs["pixel_values"].squeeze(0)
+        payload = {k: v.squeeze(0) for k, v in inputs.items()}
 
-        full_tokens = self.processor.tokenizer(prompt).input_ids
-        prompt_len = len(full_tokens)
+        prompt_tokens = self.processor(
+            text=prompt,
+            images=image,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_length
+        ).input_ids.squeeze(0)
+        
+        prompt_len = len(prompt_tokens)
 
-        labels = input_ids.clone()
+        labels = payload["input_ids"].clone()
         labels[:prompt_len] = -100
-        labels[attention_mask == 0] = -100
+        labels[payload["attention_mask"] == 0] = -100
+        payload["labels"] = labels
 
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "pixel_values": pixel_values,
-            "labels": labels
-        }
+        return payload
 
 
 def _parse_metrics_from_text(text: str) -> tuple[int | None, int | None]:
-    """Extracts Action and Halt from Gemma's response text."""
     try:
         action_match = re.search(r"Action:\s*(\d+)", text)
         halt_match = re.search(r"Halt:\s*(\d+)", text)
@@ -207,18 +214,11 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
         for batch_idx, batch in enumerate(pbar):
             optimizer.zero_grad()
             
-            input_ids = batch["input_ids"].to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            pixel_values = batch["pixel_values"].to(device, dtype=torch.bfloat16)
-            labels = batch["labels"].to(device)
+            batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            if "pixel_values" in batch:
+                batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
             
-            outputs = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                labels=labels,
-                return_dict=True
-            )
+            outputs = model(**batch, return_dict=True)
             
             loss = outputs.loss
             loss.backward()
@@ -226,13 +226,10 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
             
             total_train_loss += loss.item()
 
-            # Live Accuracy Calculation (on the last batch sample)
             with torch.no_grad():
-                # We only check accuracy for the first item in batch to keep it fast
                 idx = 0
                 logits = outputs.logits[idx]
-                target_ids = labels[idx]
-                # Filter out -100 labels
+                target_ids = batch["labels"][idx]
                 valid_mask = target_ids != -100
                 if valid_mask.any():
                     pred_ids = torch.argmax(logits, dim=-1)[valid_mask]
@@ -248,23 +245,17 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
                     if p_halt == t_halt: correct_halts += 1
                     total_processed += 1
 
-                    # Periodic Verbose Log
                     if batch_idx % config.log_sample_every == 0:
                         tqdm.write(f"\n[Batch {batch_idx}] Sample Progress:")
                         tqdm.write(f"  Ground Truth: {true_text.strip()}")
                         tqdm.write(f"  Prediction:   {pred_text.strip()}")
                         tqdm.write(f"  Current Loss: {loss.item():.4f}")
 
-            # Update Progress Bar
             act_acc = (correct_actions / total_processed * 100) if total_processed > 0 else 0
-            pbar.set_postfix({
-                "loss": f"{loss.item():.3f}",
-                "act_acc": f"{act_acc:.1f}%",
-            })
+            pbar.set_postfix({"loss": f"{loss.item():.3f}", "act_acc": f"{act_acc:.1f}%"})
 
         avg_train_loss = total_train_loss / len(train_loader)
         
-        # --- Evaluation Split ---
         model.eval()
         total_eval_loss = 0.0
         eval_correct_actions = 0
@@ -272,23 +263,15 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
         
         with torch.no_grad():
             for batch in tqdm(eval_loader, desc=f"Epoch {epoch}/{config.epochs} [Eval]"):
-                input_ids = batch["input_ids"].to(device)
-                attention_mask = batch["attention_mask"].to(device)
-                pixel_values = batch["pixel_values"].to(device, dtype=torch.bfloat16)
-                labels = batch["labels"].to(device)
+                batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+                if "pixel_values" in batch:
+                    batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
                 
-                outputs = model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    pixel_values=pixel_values,
-                    labels=labels,
-                    return_dict=True
-                )
+                outputs = model(**batch, return_dict=True)
                 total_eval_loss += outputs.loss.item()
                 
-                # Check accuracy on evaluation
-                pred_ids = torch.argmax(outputs.logits[0], dim=-1)[labels[0] != -100]
-                true_ids = labels[0][labels[0] != -100]
+                pred_ids = torch.argmax(outputs.logits[0], dim=-1)[batch["labels"][0] != -100]
+                true_ids = batch["labels"][0][batch["labels"][0] != -100]
                 pred_text = processor.tokenizer.decode(pred_ids, skip_special_tokens=True)
                 true_text = processor.tokenizer.decode(true_ids, skip_special_tokens=True)
                 pa, _ = _parse_metrics_from_text(pred_text)
