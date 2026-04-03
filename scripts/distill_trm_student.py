@@ -19,6 +19,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Distill the TRM-like student from a Gemma hidden layer.")
     parser.add_argument("--foundation-model-id", default="google/gemma-4-e2b")
     parser.add_argument("--teacher-layer-index", type=int, default=17)
+    parser.add_argument("--teacher-layer-indices", type=int, nargs="*", default=None)
+    parser.add_argument("--teacher-feature-pooling", choices=("mean", "concat"), default="mean")
+    parser.add_argument("--cache-dir")
     parser.add_argument("--task-count", type=int, default=4096)
     parser.add_argument("--eval-task-count", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -37,10 +40,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-loss-weight", type=float, default=2.0)
     parser.add_argument("--action-regression-weight", type=float, default=0.5)
     parser.add_argument("--halt-loss-weight", type=float, default=0.5)
-    parser.add_argument("--teacher-representation-weight", type=float, default=1.0)
-    parser.add_argument("--teacher-kl-weight", type=float, default=1.0)
+    parser.add_argument("--teacher-representation-weight", type=float, default=0.0)
+    parser.add_argument("--teacher-kl-weight", type=float, default=0.25)
     parser.add_argument("--teacher-probe-epochs", type=int, default=5)
     parser.add_argument("--teacher-probe-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--teacher-probe-batch-size", type=int, default=64)
     parser.add_argument("--teacher-temperature", type=float, default=2.0)
     parser.add_argument("--teacher-max-length", type=int, default=768)
     return parser.parse_args()
@@ -48,10 +52,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    teacher_layer_indices = tuple(args.teacher_layer_indices) if args.teacher_layer_indices else (args.teacher_layer_index,)
     summary = distill_student(
         DistillationConfig(
             foundation_model_id=args.foundation_model_id,
-            teacher_layer_index=args.teacher_layer_index,
+            teacher_layer_indices=teacher_layer_indices,
+            teacher_feature_pooling=args.teacher_feature_pooling,
+            cache_dir=args.cache_dir,
             task_count=args.task_count,
             eval_task_count=args.eval_task_count,
             batch_size=args.batch_size,
@@ -74,6 +81,7 @@ def main() -> int:
             teacher_kl_weight=args.teacher_kl_weight,
             teacher_probe_epochs=args.teacher_probe_epochs,
             teacher_probe_learning_rate=args.teacher_probe_learning_rate,
+            teacher_probe_batch_size=args.teacher_probe_batch_size,
             teacher_temperature=args.teacher_temperature,
             teacher_max_length=args.teacher_max_length,
         )
