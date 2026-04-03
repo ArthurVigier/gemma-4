@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 from .arc_drone_bench import ARCDroneBench
 from .config import BenchmarkConfig, DeploymentConfig, ReasonerConfig
 from .export_tensorrt import build_trtexec_command, export_reasoner_model_to_onnx
-from .gemma_layer_sweep import build_teacher_features
+from .gemma_layer_sweep import LayerProbe, build_teacher_features
 from .model import TRMReasoner
 from .student_training import (
     ArcStudentDataset,
@@ -52,13 +52,26 @@ class DistillationConfig:
     action_regression_weight: float = 0.5
     halt_loss_weight: float = 0.5
     teacher_representation_weight: float = 1.0
+    teacher_kl_weight: float = 1.0
+    teacher_probe_epochs: int = 5
+    teacher_probe_learning_rate: float = 1e-3
+    teacher_temperature: float = 2.0
     teacher_max_length: int = 768
 
 
 class DistillationDataset(Dataset[dict[str, torch.Tensor]]):
-    def __init__(self, *, base_dataset: ArcStudentDataset, teacher_features: torch.Tensor) -> None:
+    def __init__(
+        self,
+        *,
+        base_dataset: ArcStudentDataset,
+        teacher_features: torch.Tensor,
+        teacher_action_logits: torch.Tensor,
+        teacher_halt_logits: torch.Tensor,
+    ) -> None:
         self.base_dataset = base_dataset
         self.teacher_features = teacher_features
+        self.teacher_action_logits = teacher_action_logits
+        self.teacher_halt_logits = teacher_halt_logits
 
     def __len__(self) -> int:
         return len(self.base_dataset)
@@ -66,6 +79,8 @@ class DistillationDataset(Dataset[dict[str, torch.Tensor]]):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         item = dict(self.base_dataset[index])
         item["teacher_features"] = self.teacher_features[index]
+        item["teacher_action_logits"] = self.teacher_action_logits[index]
+        item["teacher_halt_logits"] = self.teacher_halt_logits[index]
         return item
 
 
@@ -81,6 +96,66 @@ class DistilledReasoner(nn.Module):
         return output, student_repr
 
 
+def _teacher_kl_divergence(
+    *,
+    student_logits: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    return F.kl_div(
+        F.log_softmax(student_logits / temperature, dim=-1),
+        F.softmax(teacher_logits / temperature, dim=-1),
+        reduction="batchmean",
+    ) * (temperature ** 2)
+
+
+def _fit_teacher_probe(
+    *,
+    teacher_features: torch.Tensor,
+    action_indices: torch.Tensor,
+    halt_steps: torch.Tensor,
+    device: torch.device,
+    config: DistillationConfig,
+) -> LayerProbe:
+    probe = LayerProbe(hidden_size=teacher_features.shape[-1], refinement_steps=config.refinement_steps).to(device)
+    optimizer = torch.optim.AdamW(probe.parameters(), lr=config.teacher_probe_learning_rate)
+    dataset = torch.utils.data.TensorDataset(teacher_features, action_indices, halt_steps)
+    loader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+
+    for _ in range(config.teacher_probe_epochs):
+        probe.train()
+        for features, actions, halts in loader:
+            optimizer.zero_grad(set_to_none=True)
+            features = features.to(device=device, dtype=torch.float32)
+            actions = actions.to(device)
+            halts = (halts.to(device) - 1).clamp(min=0)
+            action_logits, halt_logits = probe(features)
+            loss = F.cross_entropy(action_logits, actions) + 0.5 * F.cross_entropy(halt_logits, halts)
+            loss.backward()
+            optimizer.step()
+
+    probe.eval()
+    return probe
+
+
+def _project_teacher_logits(
+    *,
+    probe: LayerProbe,
+    teacher_features: torch.Tensor,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    loader = DataLoader(teacher_features, batch_size=256, shuffle=False)
+    action_logits_batches: list[torch.Tensor] = []
+    halt_logits_batches: list[torch.Tensor] = []
+    with torch.no_grad():
+        for features in loader:
+            features = features.to(device=device, dtype=torch.float32)
+            action_logits, halt_logits = probe(features)
+            action_logits_batches.append(action_logits.cpu())
+            halt_logits_batches.append(halt_logits.cpu())
+    return torch.cat(action_logits_batches, dim=0), torch.cat(halt_logits_batches, dim=0)
+
+
 def _compute_distillation_loss(
     *,
     model: DistilledReasoner,
@@ -93,6 +168,8 @@ def _compute_distillation_loss(
     action_target_vector = batch["action_target_vector"].to(device)
     halt_step = batch["halt_step"].to(device) - 1
     teacher_features = batch["teacher_features"].to(device=device, dtype=torch.float32)
+    teacher_action_logits = batch["teacher_action_logits"].to(device=device, dtype=torch.float32)
+    teacher_halt_logits = batch["teacher_halt_logits"].to(device=device, dtype=torch.float32)
 
     output, student_repr = model(grid)
     action_loss = F.cross_entropy(output.action_logits, action_index)
@@ -101,11 +178,22 @@ def _compute_distillation_loss(
     action_regression_loss = F.smooth_l1_loss(expected_action, action_target_vector)
     halt_loss = F.cross_entropy(output.halt_logits, halt_step)
     teacher_representation_loss = F.smooth_l1_loss(student_repr, teacher_features)
+    teacher_action_kl = _teacher_kl_divergence(
+        student_logits=output.action_logits,
+        teacher_logits=teacher_action_logits,
+        temperature=config.teacher_temperature,
+    )
+    teacher_halt_kl = _teacher_kl_divergence(
+        student_logits=output.halt_logits,
+        teacher_logits=teacher_halt_logits,
+        temperature=config.teacher_temperature,
+    )
     total_loss = (
         config.action_loss_weight * action_loss
         + config.action_regression_weight * action_regression_loss
         + config.halt_loss_weight * halt_loss
         + config.teacher_representation_weight * teacher_representation_loss
+        + config.teacher_kl_weight * (teacher_action_kl + teacher_halt_kl)
     )
 
     action_accuracy = float((output.action_logits.argmax(dim=-1) == action_index).float().mean().item())
@@ -182,8 +270,35 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
 
     train_base = ArcStudentDataset(train_tasks, reasoner_config)
     eval_base = ArcStudentDataset(eval_tasks, reasoner_config)
-    train_dataset = DistillationDataset(base_dataset=train_base, teacher_features=train_teacher_features[config.teacher_layer_index])
-    eval_dataset = DistillationDataset(base_dataset=eval_base, teacher_features=eval_teacher_features[config.teacher_layer_index])
+    teacher_probe = _fit_teacher_probe(
+        teacher_features=train_teacher_features[config.teacher_layer_index],
+        action_indices=torch.stack([train_base[index]["action_index"] for index in range(len(train_base))]),
+        halt_steps=torch.stack([train_base[index]["halt_step"] for index in range(len(train_base))]),
+        device=device,
+        config=config,
+    )
+    train_teacher_action_logits, train_teacher_halt_logits = _project_teacher_logits(
+        probe=teacher_probe,
+        teacher_features=train_teacher_features[config.teacher_layer_index],
+        device=device,
+    )
+    eval_teacher_action_logits, eval_teacher_halt_logits = _project_teacher_logits(
+        probe=teacher_probe,
+        teacher_features=eval_teacher_features[config.teacher_layer_index],
+        device=device,
+    )
+    train_dataset = DistillationDataset(
+        base_dataset=train_base,
+        teacher_features=train_teacher_features[config.teacher_layer_index],
+        teacher_action_logits=train_teacher_action_logits,
+        teacher_halt_logits=train_teacher_halt_logits,
+    )
+    eval_dataset = DistillationDataset(
+        base_dataset=eval_base,
+        teacher_features=eval_teacher_features[config.teacher_layer_index],
+        teacher_action_logits=eval_teacher_action_logits,
+        teacher_halt_logits=eval_teacher_halt_logits,
+    )
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
     eval_loader = DataLoader(eval_dataset, batch_size=config.batch_size, shuffle=False)
@@ -269,7 +384,7 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
         cloud_gpu_recommendation=CURRENT_STACK_2026.training.cloud_gpu_recommendation(),
         best_eval_action_accuracy=best_eval_action_accuracy,
         best_eval_halt_step_mae=best_eval_halt_step_mae,
-        epochs=[],
+        epochs=history,
         onnx_output_path=onnx_output_path,
         trtexec_command=trtexec_command,
     )

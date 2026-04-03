@@ -38,6 +38,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-regression-weight", type=float, default=0.5)
     parser.add_argument("--halt-loss-weight", type=float, default=0.5)
     parser.add_argument("--teacher-representation-weight", type=float, default=1.0)
+    parser.add_argument("--teacher-kl-weight", type=float, default=1.0)
+    parser.add_argument("--teacher-probe-epochs", type=int, default=5)
+    parser.add_argument("--teacher-probe-learning-rate", type=float, default=1e-3)
+    parser.add_argument("--teacher-temperature", type=float, default=2.0)
     parser.add_argument("--teacher-max-length", type=int, default=768)
     return parser.parse_args()
 
@@ -67,6 +71,10 @@ def main() -> int:
             action_regression_weight=args.action_regression_weight,
             halt_loss_weight=args.halt_loss_weight,
             teacher_representation_weight=args.teacher_representation_weight,
+            teacher_kl_weight=args.teacher_kl_weight,
+            teacher_probe_epochs=args.teacher_probe_epochs,
+            teacher_probe_learning_rate=args.teacher_probe_learning_rate,
+            teacher_temperature=args.teacher_temperature,
             teacher_max_length=args.teacher_max_length,
         )
     )
