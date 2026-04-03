@@ -83,16 +83,25 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         bnb_4bit_use_double_quant=True,  # Extra memory saving for huge models
     )
 
+    # By setting torch_dtype to bfloat16, we prevent transformers from defaulting
+    # to float32 for certain unquantized layers (like LM head), saving gigabytes of VRAM.
     model = AutoModelForImageTextToText.from_pretrained(
         config.foundation_model_id,
         quantization_config=bnb_config,
         device_map="auto",
+        torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
     
     # Enable gradient checkpointing to save VRAM during training of massive models
     model.gradient_checkpointing_enable()
-    model = prepare_model_for_kbit_training(model)
+
+    # We manually cast layers that PEFT normally casts to fp32 (causing OOM on 80GB)
+    # into bfloat16 instead, which is native for A100 and halves the memory spike.
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    for name, param in model.named_parameters():
+        if param.dtype == torch.float32:
+            param.data = param.data.to(torch.bfloat16)
     
     # For MoE models, target modules often include expert routing layers depending on the exact architecture.
     # The standard attention/MLP projections are targeted here.
@@ -105,6 +114,12 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
     )
     
     model = get_peft_model(model, lora_config)
+    
+    # Ensure LoRA adapters are also bfloat16, not float32
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            param.data = param.data.to(torch.bfloat16)
+
     model.print_trainable_parameters()
 
     print("\nGenerating ARC-Drone tasks for fine-tuning...")
