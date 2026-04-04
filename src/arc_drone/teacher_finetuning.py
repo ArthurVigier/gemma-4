@@ -228,9 +228,11 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
             param.data = param.data.to(torch.bfloat16)
     model.print_trainable_parameters()
 
-    print("\nGenerating ARC-Drone tasks for fine-tuning...")
-    train_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed)).generate_tasks()
-    eval_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1)).generate_tasks()
+    print("\nGenerating augmented ARC-Drone tasks for fine-tuning...")
+    bench = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed))
+    train_tasks = bench.generate_tasks(augment=True)
+    eval_bench = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1))
+    eval_tasks = eval_bench.generate_tasks(augment=True)
 
     train_dataset = TeacherHybridDataset(train_tasks, processor, config.max_length)
     eval_dataset = TeacherHybridDataset(eval_tasks, processor, config.max_length)
