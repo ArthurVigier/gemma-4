@@ -257,7 +257,7 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         config.foundation_model_id,
         quantization_config=bnb_config,
         device_map="auto",
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
         trust_remote_code=True,
     )
