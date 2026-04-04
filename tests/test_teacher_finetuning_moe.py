@@ -64,6 +64,42 @@ class _FakeProcessor:
         )
 
 
+class _LongPromptProcessor(_FakeProcessor):
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompt = "<very-long-multimodal-prompt>"
+        self.image_seq_length = 0
+
+    def __call__(
+        self,
+        *,
+        text: str,
+        images=None,
+        return_tensors: str,
+        padding: str | None = None,
+        max_length: int | None = None,
+        truncation: bool | None = None,
+    ) -> _FakeBatch:
+        self.calls.append(
+            {
+                "text": text,
+                "images": images,
+                "padding": padding,
+                "max_length": max_length,
+                "truncation": truncation,
+            }
+        )
+        seq_len = int(max_length or 6)
+        input_ids = torch.arange(1, seq_len + 1, dtype=torch.long).unsqueeze(0)
+        attention_mask = torch.ones_like(input_ids)
+        pixel_values = torch.zeros((1, 3, 2, 2), dtype=torch.float32)
+        return _FakeBatch(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+        )
+
+
 def test_teacher_moe_dataset_uses_chat_template_for_multimodal_prompt() -> None:
     processor = _FakeProcessor()
     task = BenchmarkTask(
@@ -107,3 +143,21 @@ def test_teacher_moe_dataset_uses_chat_template_for_multimodal_prompt() -> None:
     assert processor.calls[0]["max_length"] == 32 + processor.image_seq_length
     assert payload["labels"].tolist() == [-100, -100, -100, -100, 21, 22, 23]
     assert payload["pixel_values"].shape == (3, 2, 2)
+
+
+def test_teacher_moe_dataset_keeps_supervised_tokens_when_prompt_fills_window() -> None:
+    processor = _LongPromptProcessor()
+    task = BenchmarkTask(
+        task_id="task-long",
+        family="forward",
+        input_grid=ArcGrid(np.array([[1, 2], [3, 4]], dtype=np.int64)),
+        target_grid=ArcGrid(np.array([[1, 2], [3, 4]], dtype=np.int64)),
+        target_action=DroneAction((0.3, 0.0, 0.0), yaw_rate=0.0, halt_probability=0.9),
+        metadata={"isaac_scene": {"entities": []}, "reasoning_trace": "Reasoning: test."},
+    )
+
+    dataset = TeacherMoEHybridDataset([task], processor, max_length=6)
+    payload = dataset[0]
+
+    assert (payload["labels"] != -100).any()
+    assert payload["labels"][-1].item() == payload["input_ids"][-1].item()

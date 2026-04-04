@@ -81,14 +81,14 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
 
         return grid_to_image(task.input_grid.values)
 
-    def _format_isaac_world_state(self, isaac_scene: dict[str, Any]) -> str:
+    def _format_isaac_world_state(self, isaac_scene: dict[str, Any], *, max_entities: int = 30) -> str:
         """Converts the Isaac Sim scene descriptor into compact text for the LLM."""
         entities = isaac_scene.get("entities", [])
         if not entities:
             return "Isaac world state unavailable."
 
         lines = ["Isaac Sim World State (NED Coordinates):"]
-        for entity in entities[:30]:
+        for entity in entities[:max_entities]:
             pos = entity.get("position", (0.0, 0.0, 0.0))
             semantics = entity.get("semantics", {})
             entity_id = semantics.get("id", "unknown")
@@ -100,8 +100,8 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
                 f"at N:{float(pos[0]):.2f}m E:{float(pos[1]):.2f}m D:{float(pos[2]):.2f}m"
             )
 
-        if len(entities) > 30:
-            lines.append(f"... {len(entities) - 30} additional entities omitted")
+        if len(entities) > max_entities:
+            lines.append(f"... {len(entities) - max_entities} additional entities omitted")
 
         randomization = isaac_scene.get("replicator_randomization")
         if isinstance(randomization, dict) and randomization:
@@ -109,11 +109,9 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
 
         return "\n".join(lines)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        task = self.tasks[index]
-        image = self._resolve_task_image(task)
+    def _build_prompt(self, task: Any, *, max_entities: int) -> str:
         text_grid = serialize_task_for_teacher(task)
-        world_state = self._format_isaac_world_state(task.metadata.get("isaac_scene", {}))
+        world_state = self._format_isaac_world_state(task.metadata.get("isaac_scene", {}), max_entities=max_entities)
         messages = [
             {
                 "role": "user",
@@ -130,18 +128,19 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
                 ],
             }
         ]
-
-        action_idx = action_to_index(task.target_action)
-        halt_step = halt_probability_to_step(halt_probability=task.target_action.halt_probability, refinement_steps=6)
-        reasoning_trace = str(task.metadata.get("reasoning_trace", "Reasoning: Analyze the pattern.")).strip()
-        answer = f"{reasoning_trace}\nAction: {action_idx}, Halt: {halt_step}"
-
-        prompt = self.processor.apply_chat_template(
+        return self.processor.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
         )
 
+    def _prepare_payload(
+        self,
+        *,
+        prompt: str,
+        answer: str,
+        image: Image.Image,
+    ) -> dict[str, Any]:
         full_text = prompt + answer + self.processor.tokenizer.eos_token
 
         try:
@@ -151,7 +150,7 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
                 return_tensors="pt",
                 padding="max_length",
                 max_length=self.max_length,
-                truncation=True
+                truncation=True,
             )
         except TypeError:
             inputs = self.processor(
@@ -169,18 +168,53 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
             prompt_inputs = self.processor(
                 text=prompt,
                 images=image,
-                return_tensors="pt"
+                return_tensors="pt",
+                truncation=True,
+                max_length=self.max_length,
             )
             prompt_len = prompt_inputs.input_ids.shape[1]
         except TypeError:
-            prompt_inputs = self.processor(text=prompt, return_tensors="pt")
+            prompt_inputs = self.processor(text=prompt, return_tensors="pt", truncation=True, max_length=self.max_length)
             prompt_len = prompt_inputs.input_ids.shape[1]
+
+        valid_token_count = int(payload["attention_mask"].sum().item())
+        prompt_len = min(prompt_len, max(valid_token_count - 1, 0))
 
         labels = payload["input_ids"].clone()
         labels[:prompt_len] = -100
         labels[payload["attention_mask"] == 0] = -100
         payload["labels"] = labels
+        return payload
 
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        task = self.tasks[index]
+        image = self._resolve_task_image(task)
+        action_idx = action_to_index(task.target_action)
+        halt_step = halt_probability_to_step(halt_probability=task.target_action.halt_probability, refinement_steps=6)
+        reasoning_trace = str(task.metadata.get("reasoning_trace", "Reasoning: Analyze the pattern.")).strip()
+        full_answer = f"{reasoning_trace}\nAction: {action_idx}, Halt: {halt_step}"
+        compact_answer = f"Action: {action_idx}, Halt: {halt_step}"
+
+        prompt = self._build_prompt(task, max_entities=30)
+        payload = self._prepare_payload(prompt=prompt, answer=full_answer, image=image)
+        if (payload["labels"] != -100).any():
+            return payload
+
+        prompt = self._build_prompt(task, max_entities=8)
+        payload = self._prepare_payload(prompt=prompt, answer=full_answer, image=image)
+        if (payload["labels"] != -100).any():
+            return payload
+
+        payload = self._prepare_payload(prompt=prompt, answer=compact_answer, image=image)
+        if (payload["labels"] != -100).any():
+            return payload
+
+        # Last-resort safeguard: keep the final non-padding token supervised to avoid NaN loss.
+        valid_indices = torch.nonzero(payload["attention_mask"], as_tuple=False).flatten()
+        if len(valid_indices) > 0:
+            labels = payload["labels"].clone()
+            labels[int(valid_indices[-1])] = payload["input_ids"][int(valid_indices[-1])]
+            payload["labels"] = labels
         return payload
 
 
