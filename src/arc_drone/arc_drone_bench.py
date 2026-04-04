@@ -622,44 +622,87 @@ class ARCDroneBench:
 
     def _generate_reasoning_trace(self, task: BenchmarkTask, rng: np.random.Generator) -> str:
         family = task.family
+        meta = task.metadata
         if family == "symmetry":
-            variants = [
-                "Reasoning: Symmetry task. The input grid shows a pattern that must be reflected. I will identify the axis of symmetry and predict the drone movement to reach the reflected target.",
-                "Reasoning: Symmetry task. I compare mirrored regions of the grid, infer the reflection rule, and align the drone decision with that mirrored structure.",
-            ]
-            return str(rng.choice(variants))
+            transform = meta.get("transform", "unknown")
+            label = meta.get("action_label", "?")
+            density = meta.get("density", "?")
+            return (
+                f"Reasoning: Symmetry task. Transform={transform}, grid density={density}. "
+                f"Mass distribution determines the correction direction. "
+                f"Predicted drone action: {label}."
+            )
         if family == "counting":
-            color_id = task.metadata.get("count_color", "?")
-            count = task.metadata.get("count", "?")
-            variants = [
-                f"Reasoning: Counting task. I must identify all pixels of target color {color_id}, count them, and use that count to determine the drone destination.",
-                f"Reasoning: Counting task. I scan the grid for color {color_id}, compute the total ({count}), and map that density to the correct action.",
-            ]
-            return str(rng.choice(variants))
+            color_id = meta.get("count_color", "?")
+            count = meta.get("count", "?")
+            density_ratio = meta.get("density_ratio", "?")
+            label = meta.get("action_label", "?")
+            return (
+                f"Reasoning: Counting task. Target color={color_id}, count={count}, "
+                f"density_ratio={density_ratio} (count vs uniform expectation per color). "
+                f"Predicted drone action: {label}."
+            )
         if family == "composition":
-            variants = [
-                "Reasoning: Composition task. I fuse overlapping spatial structures and track how the merged shape changes the correct movement choice.",
-                "Reasoning: Composition task. I analyze the rotated and merged regions, then choose the action that matches the composed pattern.",
-            ]
-            return str(rng.choice(variants))
+            k = meta.get("rotation_k", "?")
+            overlap_ratio = meta.get("overlap_ratio", "?")
+            label = meta.get("action_label", "?")
+            return (
+                f"Reasoning: Composition task. Rotation k={k} (×90°), "
+                f"overlap_ratio={overlap_ratio} (fraction of original cells covered by rotated layer). "
+                f"Predicted drone action: {label}."
+            )
         if family == "path_planning":
-            opening_row = task.metadata.get("opening_row", "?")
-            variants = [
-                f"Reasoning: Path planning task. I locate the obstacle opening near row {opening_row} and choose the maneuver that threads the drone through the gap.",
-                f"Reasoning: Path planning task. I trace the free corridor around the central wall, verify the opening at row {opening_row}, and align the action with that route.",
-            ]
-            return str(rng.choice(variants))
+            opening_row = meta.get("opening_row", "?")
+            gap_size = meta.get("gap_size", "?")
+            label = meta.get("action_label", "?")
+            h = self.config.grid_height
+            third = h // 3
+            return (
+                f"Reasoning: Path planning task. Wall opening at row={opening_row} "
+                f"(grid height={h}, thirds at {third}/{2 * third}), gap_size={gap_size}. "
+                f"Predicted drone action: {label}."
+            )
         return f"Reasoning: {family} task. Analyzing spatial relations between objects."
 
     def _make_symmetry_task(self, rng: np.random.Generator, index: int) -> BenchmarkTask:
         grid = self._random_grid(rng)
-        target = np.fliplr(grid)
+        transform_choice = int(rng.integers(0, 4))
+
+        if transform_choice == 0:  # horizontal mirror
+            target = np.fliplr(grid)
+            left_mass = int(np.sum(grid[:, :grid.shape[1] // 2] > 0))
+            right_mass = int(np.sum(grid[:, grid.shape[1] // 2:] > 0))
+            if left_mass >= right_mass:
+                vel, yaw, action_label = (0.0, 0.3, 0.0), 0.0, "east"
+            else:
+                vel, yaw, action_label = (0.0, -0.3, 0.0), 0.0, "west"
+            transform_name = "mirror_horizontal"
+        elif transform_choice == 1:  # vertical mirror
+            target = np.flipud(grid)
+            top_mass = int(np.sum(grid[:grid.shape[0] // 2, :] > 0))
+            bottom_mass = int(np.sum(grid[grid.shape[0] // 2:, :] > 0))
+            if bottom_mass >= top_mass:
+                vel, yaw, action_label = (0.3, 0.0, 0.0), 0.0, "north"
+            else:
+                vel, yaw, action_label = (-0.3, 0.0, 0.0), 0.0, "south"
+            transform_name = "mirror_vertical"
+        elif transform_choice == 2:  # 90° CCW
+            target = np.rot90(grid, k=1)
+            vel, yaw, action_label = (0.0, 0.0, 0.0), -0.25, "yaw_neg"
+            transform_name = "rotate_90_ccw"
+        else:  # 90° CW
+            target = np.rot90(grid, k=3)
+            vel, yaw, action_label = (0.0, 0.0, 0.0), 0.25, "yaw_pos"
+            transform_name = "rotate_90_cw"
+
+        density = float(np.mean(grid > 0))
+        halt_prob = round(float(np.clip(0.82 + 0.15 * density, 0.82, 0.97)), 3)
         return self._task(
             index=index, family="symmetry", input_grid=grid, target_grid=target,
-            action=DroneAction((0.0, 0.3, 0.0), 0.0, 0.95),
+            action=DroneAction(vel, yaw, halt_prob),
             target_zone=TargetZone((0.0, 1.2, -1.5), 0.45),
             target_entity_name=default_target_entity_name("symmetry"),
-            metadata={"transform": "mirror_x"}
+            metadata={"transform": transform_name, "action_label": action_label, "density": round(density, 3)},
         )
 
     def _make_counting_task(self, rng: np.random.Generator, index: int) -> BenchmarkTask:
@@ -667,39 +710,80 @@ class ARCDroneBench:
         color = int(rng.integers(1, 9))
         count = int(np.sum(grid == color))
         target = np.full_like(grid, count % 10)
+
+        expected_per_color = grid.size / 9.0
+        density_ratio = count / max(expected_per_color, 1.0)
+        if density_ratio < 0.5:
+            vel, action_label = (-0.3, 0.0, 0.0), "south"
+        elif density_ratio < 1.0:
+            vel, action_label = (0.0, -0.3, 0.0), "west"
+        elif density_ratio < 1.5:
+            vel, action_label = (0.0, 0.3, 0.0), "east"
+        else:
+            vel, action_label = (0.3, 0.0, 0.0), "north"
+
+        halt_prob = round(float(np.clip(0.78 + 0.02 * min(count, 10), 0.78, 0.98)), 3)
         return self._task(
             index=index, family="counting", input_grid=grid, target_grid=target,
-            action=DroneAction((0.3, 0.0, 0.0), 0.0, 0.9),
+            action=DroneAction(vel, 0.0, halt_prob),
             target_zone=TargetZone((1.0, 0.0, -1.2), 0.4),
             target_entity_name=default_target_entity_name("counting"),
-            metadata={"count_color": color, "count": count}
+            metadata={"count_color": color, "count": count, "density_ratio": round(density_ratio, 3), "action_label": action_label},
         )
 
     def _make_composition_task(self, rng: np.random.Generator, index: int) -> BenchmarkTask:
         grid = self._random_grid(rng)
-        rotated = np.rot90(grid)
+        k = int(rng.choice([1, 2, 3]))
+        rotated = np.rot90(grid, k=k)
         target = np.where(rotated > 0, rotated, grid)
+
+        occupied = int(np.sum(grid > 0))
+        overlap_count = int(np.sum((rotated > 0) & (grid > 0)))
+        overlap_ratio = overlap_count / max(occupied, 1)
+
+        if k == 1:
+            vel, yaw, action_label = (0.0, 0.0, 0.0), -0.25, "yaw_neg"
+        elif k == 3:
+            vel, yaw, action_label = (0.0, 0.0, 0.0), 0.25, "yaw_pos"
+        elif overlap_ratio >= 0.25:
+            vel, yaw, action_label = (0.0, 0.0, 0.3), 0.0, "up"
+        else:
+            vel, yaw, action_label = (0.0, 0.0, -0.3), 0.0, "down"
+
+        halt_prob = round(float(np.clip(0.83 + 0.10 * overlap_ratio, 0.83, 0.93)), 3)
         return self._task(
             index=index, family="composition", input_grid=grid, target_grid=target,
-            action=DroneAction((0.0, 0.0, 0.3), 0.0, 0.88),
+            action=DroneAction(vel, yaw, halt_prob),
             target_zone=TargetZone((0.0, 0.0, -2.0), 0.35),
             target_entity_name=default_target_entity_name("composition"),
-            metadata={"transform": "rotate_merge"}
+            metadata={"transform": f"rotate_{k * 90}_merge", "rotation_k": k, "overlap_ratio": round(overlap_ratio, 3), "action_label": action_label},
         )
 
     def _make_path_planning_task(self, rng: np.random.Generator, index: int) -> BenchmarkTask:
+        gap_size = int(rng.integers(2, 5))  # 2, 3, or 4 rows
+        half_gap = gap_size // 2
+        opening = int(rng.integers(half_gap + 1, self.config.grid_height - half_gap - 1))
         grid = np.zeros((self.config.grid_height, self.config.grid_width), dtype=np.int64)
-        opening = int(rng.integers(1, self.config.grid_height - 1))
         grid[:, self.config.grid_width // 2] = 2
-        grid[opening - 1:opening + 2, self.config.grid_width // 2] = 0
+        grid[opening - half_gap: opening + half_gap + 1, self.config.grid_width // 2] = 0
         target = grid.copy()
         target[opening, -1] = 4
+
+        h = self.config.grid_height
+        if opening < h // 3:
+            vel, yaw, action_label = (0.3, 0.0, 0.0), 0.0, "north"
+        elif opening >= 2 * h // 3:
+            vel, yaw, action_label = (-0.3, 0.0, 0.0), 0.0, "south"
+        else:
+            vel, yaw, action_label = (0.0, 0.3, 0.0), 0.0, "east"
+
+        halt_prob = round(float(np.clip(0.97 - 0.04 * gap_size, 0.81, 0.97)), 3)
         return self._task(
             index=index, family="path_planning", input_grid=grid, target_grid=target,
-            action=DroneAction((0.0, 0.0, 0.0), 0.25, 0.9),
+            action=DroneAction(vel, yaw, halt_prob),
             target_zone=TargetZone((1.8, 0.0, -1.5), 0.4),
             target_entity_name=default_target_entity_name("path_planning"),
-            metadata={"opening_row": opening}
+            metadata={"opening_row": opening, "gap_size": gap_size, "action_label": action_label},
         )
 
     def _task(self, index: int, family: str, input_grid: np.ndarray, target_grid: np.ndarray,
