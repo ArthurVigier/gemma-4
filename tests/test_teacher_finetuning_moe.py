@@ -71,6 +71,21 @@ def test_teacher_moe_dataset_uses_chat_template_for_multimodal_prompt() -> None:
         input_grid=ArcGrid(np.array([[1, 2], [3, 4]], dtype=np.int64)),
         target_grid=ArcGrid(np.array([[1, 2], [3, 4]], dtype=np.int64)),
         target_action=DroneAction((0.3, 0.0, 0.0), yaw_rate=0.0, halt_probability=0.9),
+        metadata={
+            "reasoning_trace": "Reasoning: Counting task. Use the object density to choose the action.",
+            "isaac_scene": {
+                "entities": [
+                    {
+                        "position": (0.15, -0.30, 0.0),
+                        "color_id": 3,
+                        "material": "plastic",
+                        "prim_type": "sphere",
+                        "semantics": {"id": "obj_0_1"},
+                    }
+                ],
+                "replicator_randomization": {"texture_jitter": True},
+            },
+        },
     )
 
     dataset = TeacherMoEHybridDataset([task], processor, max_length=32)
@@ -79,7 +94,12 @@ def test_teacher_moe_dataset_uses_chat_template_for_multimodal_prompt() -> None:
     assert processor.chat_messages is not None
     content = processor.chat_messages[0]["content"]
     assert content[0] == {"type": "image"}
+    assert "--- PHYSICAL SENSORS ---" in content[1]["text"]
+    assert "obj_0_1" in content[1]["text"]
+    assert "Replicator randomization" in content[1]["text"]
+    assert "--- LOGICAL GRID ---" in content[1]["text"]
     assert "Predict the best drone action family and halting step." in content[1]["text"]
+    assert "Reasoning: Counting task." in processor.calls[0]["text"]
     assert all("<image>" not in call["text"] for call in processor.calls)
     assert all(call["images"] is not None for call in processor.calls)
     assert processor.calls[0]["max_length"] == 32 + processor.image_seq_length
