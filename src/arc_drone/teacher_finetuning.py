@@ -26,6 +26,15 @@ from .config import BenchmarkConfig
 from .gemma_layer_sweep import _lazy_import_transformers, serialize_task_for_teacher
 from .student_training import action_to_index, halt_probability_to_step, select_device, set_seed
 
+_ANNOTATION_USER_PROMPT = (
+    "Analyze this drone aerial image.\n\n"
+    "Step 1 — Describe what you see: object types, approximate count, spatial distribution.\n"
+    "Step 2 — Identify the dominant cluster: where is it in the frame?\n"
+    "Step 3 — Decide the action: which action best moves the drone toward the dominant cluster?\n"
+    "Step 4 — Assess confidence: how clear is the target? (1=very clear, 6=very ambiguous)\n\n"
+    "Then output:\nAction: <0-7>\nHalt: <1-6>"
+)
+
 # Official ARC color palette
 ARC_COLORS = [
     (0, 0, 0),        # 0: black
@@ -71,6 +80,12 @@ class TeacherFinetuneConfig:
     real_data_ratio: float = 0.0
     real_dataset: str | None = None
     real_dataset_split: str = "train"
+    # Path to a JSONL file produced by scripts/annotate_visdrone.py.
+    # When set, the model is fine-tuned on real drone annotations instead of
+    # (or mixed with) synthetic ARC tasks.
+    annotated_data_path: str | None = None
+    # Fraction of the batch drawn from annotated data when mixing with synthetic.
+    annotated_data_ratio: float = 1.0
 
 
 class TeacherHybridDataset(Dataset[dict[str, torch.Tensor]]):
@@ -164,6 +179,130 @@ class TeacherHybridDataset(Dataset[dict[str, torch.Tensor]]):
         return payload
 
 
+class AnnotatedDroneDataset(Dataset[dict[str, torch.Tensor]]):
+    """Dataset built from a JSONL file produced by scripts/annotate_visdrone.py.
+
+    Each record must have:
+        - reasoning_trace: str  (CoT + "Action: X\\nHalt: Y")
+        - action_index: int
+        - halt_step: int
+        - (optional) image_b64: str  OR the HF dataset will be re-streamed lazily
+    """
+
+    def __init__(
+        self,
+        jsonl_path: Path,
+        processor: Any,
+        max_length: int,
+        *,
+        dataset_id: str = "Voxel51/VisDrone2019-DET",
+        split: str = "train",
+        seed: int = 42,
+    ) -> None:
+        self.processor = processor
+        image_seq_length = getattr(processor, "image_seq_length", 280)
+        try:
+            self.image_seq_length = int(image_seq_length)
+        except (TypeError, ValueError):
+            self.image_seq_length = 280
+        self.max_length = max_length + self.image_seq_length
+
+        # Load records
+        records = []
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        self.records = records
+
+        # Build sample_id → HF row index mapping by streaming once
+        self._images: dict[str, Any] = {}
+        print(f"  Loading VisDrone images for {len(records)} annotated samples...")
+        try:
+            from datasets import load_dataset
+            hf_ds = load_dataset(dataset_id, split=split, streaming=True)
+            hf_ds = hf_ds.shuffle(buffer_size=5000, seed=seed)
+            needed_ids = {r["sample_id"] for r in records}
+            for idx, row in enumerate(hf_ds):
+                sid = f"visdrone-{idx:06d}"
+                if sid in needed_ids:
+                    img = row.get("image")
+                    if img is not None and hasattr(img, "convert"):
+                        self._images[sid] = img.convert("RGB")
+                if len(self._images) >= len(needed_ids):
+                    break
+            print(f"  Loaded {len(self._images)}/{len(needed_ids)} images.")
+        except Exception as e:
+            print(f"  Warning: could not pre-load images ({e}). Will use blank placeholders.")
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def _supports_chat_template(self) -> bool:
+        processor_template = getattr(self.processor, "chat_template", None)
+        tokenizer_template = getattr(getattr(self.processor, "tokenizer", None), "chat_template", None)
+        return bool(processor_template or tokenizer_template)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        record = self.records[index]
+        sample_id = record["sample_id"]
+
+        image = self._images.get(sample_id)
+        if image is None:
+            image = Image.new("RGB", (640, 480), color=(100, 100, 100))
+
+        reasoning_trace = record["reasoning_trace"]
+        action_index = int(record["action_index"])
+        halt_step = int(record["halt_step"])
+        answer = f"Action: {action_index}\nHalt: {halt_step}"
+
+        # Build prompt: user asks, model reasons + answers
+        if self._supports_chat_template():
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": _ANNOTATION_USER_PROMPT},
+                    ],
+                }
+            ]
+            prompt = self.processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        else:
+            prompt = f"<image>\n{_ANNOTATION_USER_PROMPT}\n"
+
+        # Target = reasoning trace + answer (model learns to generate the full CoT)
+        full_text = prompt + reasoning_trace.strip() + "\n" + answer + self.processor.tokenizer.eos_token
+
+        inputs = self.processor(
+            text=full_text,
+            images=image,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=self.max_length,
+            truncation=True,
+        )
+        payload = {k: v.squeeze(0) for k, v in inputs.items()}
+
+        prompt_tokens = self.processor(
+            text=prompt,
+            images=image,
+            return_tensors="pt",
+            truncation=True,
+            max_length=self.max_length,
+        ).input_ids.squeeze(0)
+
+        labels = payload["input_ids"].clone()
+        labels[: len(prompt_tokens)] = -100
+        labels[payload["attention_mask"] == 0] = -100
+        payload["labels"] = labels
+
+        return payload
+
+
 def _parse_metrics_from_text(text: str) -> tuple[int | None, int | None]:
     try:
         action_match = re.search(r"Action:\s*(\d+)", text)
@@ -233,28 +372,68 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
             param.data = param.data.to(torch.bfloat16)
     model.print_trainable_parameters()
 
-    print("\nGenerating augmented ARC-Drone tasks for fine-tuning...")
-    train_bench_config = BenchmarkConfig(
-        task_count=config.task_count,
-        seed=config.seed,
-        real_data_path=config.real_data_path,
-        real_data_ratio=config.real_data_ratio,
-        real_dataset=config.real_dataset,
-        real_dataset_split=config.real_dataset_split,
-    )
-    eval_bench_config = BenchmarkConfig(
-        task_count=config.eval_task_count,
-        seed=config.seed + 1,
-        real_data_path=config.real_data_path,
-        real_data_ratio=config.real_data_ratio,
-        real_dataset=config.real_dataset,
-        real_dataset_split=config.real_dataset_split,
-    )
-    train_tasks = ARCDroneBench(train_bench_config).generate_tasks(augment=True)
-    eval_tasks = ARCDroneBench(eval_bench_config).generate_tasks(augment=True)
+    if config.annotated_data_path is not None:
+        # --- Real-data path: use auto-annotated VisDrone JSONL ---
+        annotated_path = Path(config.annotated_data_path)
+        print(f"\nLoading annotated real drone data from {annotated_path}...")
+        all_records_raw = []
+        with open(annotated_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    all_records_raw.append(line)
 
-    train_dataset = TeacherHybridDataset(train_tasks, processor, config.max_length)
-    eval_dataset = TeacherHybridDataset(eval_tasks, processor, config.max_length)
+        rng = np.random.default_rng(config.seed)
+        indices = rng.permutation(len(all_records_raw))
+        eval_n = min(config.eval_task_count, max(1, len(all_records_raw) // 10))
+        train_n = min(config.task_count, len(all_records_raw) - eval_n)
+
+        train_lines = [all_records_raw[i] for i in indices[:train_n]]
+        eval_lines = [all_records_raw[i] for i in indices[train_n: train_n + eval_n]]
+
+        # Write temp splits
+        import tempfile, os
+        tmp_dir = Path(tempfile.mkdtemp())
+        train_jsonl = tmp_dir / "train.jsonl"
+        eval_jsonl = tmp_dir / "eval.jsonl"
+        train_jsonl.write_text("\n".join(train_lines), encoding="utf-8")
+        eval_jsonl.write_text("\n".join(eval_lines), encoding="utf-8")
+
+        dataset_id = "Voxel51/VisDrone2019-DET"
+        split = config.real_dataset_split if config.real_dataset_split else "train"
+
+        print(f"  Train samples: {train_n} | Eval samples: {eval_n}")
+        train_dataset = AnnotatedDroneDataset(
+            train_jsonl, processor, config.max_length,
+            dataset_id=dataset_id, split=split, seed=config.seed,
+        )
+        eval_dataset = AnnotatedDroneDataset(
+            eval_jsonl, processor, config.max_length,
+            dataset_id=dataset_id, split=split, seed=config.seed + 1,
+        )
+    else:
+        # --- Synthetic ARC proxy path (legacy) ---
+        print("\nGenerating augmented ARC-Drone tasks for fine-tuning...")
+        train_bench_config = BenchmarkConfig(
+            task_count=config.task_count,
+            seed=config.seed,
+            real_data_path=config.real_data_path,
+            real_data_ratio=config.real_data_ratio,
+            real_dataset=config.real_dataset,
+            real_dataset_split=config.real_dataset_split,
+        )
+        eval_bench_config = BenchmarkConfig(
+            task_count=config.eval_task_count,
+            seed=config.seed + 1,
+            real_data_path=config.real_data_path,
+            real_data_ratio=config.real_data_ratio,
+            real_dataset=config.real_dataset,
+            real_dataset_split=config.real_dataset_split,
+        )
+        train_tasks = ARCDroneBench(train_bench_config).generate_tasks(augment=True)
+        eval_tasks = ARCDroneBench(eval_bench_config).generate_tasks(augment=True)
+        train_dataset = TeacherHybridDataset(train_tasks, processor, config.max_length)
+        eval_dataset = TeacherHybridDataset(eval_tasks, processor, config.max_length)
 
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
     eval_loader = DataLoader(eval_dataset, batch_size=config.batch_size, shuffle=False)

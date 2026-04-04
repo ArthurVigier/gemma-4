@@ -28,6 +28,8 @@ def main() -> None:
     parser.add_argument("--real-data-ratio", type=float, default=0.0, help="Fraction of tasks from real data.")
     parser.add_argument("--real-dataset", type=str, default=None, help="HF dataset preset (e.g. visdrone).")
     parser.add_argument("--real-dataset-split", type=str, default="train", help="Dataset split.")
+    parser.add_argument("--annotated-data-path", type=str, default=None, help="JSONL from annotate_visdrone.py.")
+    parser.add_argument("--annotated-data-ratio", type=float, default=1.0, help="Fraction of batch from annotated data.")
 
     args = parser.parse_args()
 
@@ -47,6 +49,8 @@ def main() -> None:
         real_data_ratio=args.real_data_ratio,
         real_dataset=args.real_dataset,
         real_dataset_split=args.real_dataset_split,
+        annotated_data_path=args.annotated_data_path,
+        annotated_data_ratio=args.annotated_data_ratio,
     )
 
     print(f"Starting QLoRA fine-tuning for {config.foundation_model_id}...")
