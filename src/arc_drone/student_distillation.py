@@ -37,14 +37,14 @@ from .student_training import (
 
 @dataclass(frozen=True, slots=True)
 class DistillationCacheConfig:
-    foundation_model_id: str = "google/gemma-4-e2b"
+    foundation_model_id: str = "google/gemma-4-e4b"
     teacher_layer_indices: tuple[int, ...] = (17,)
     teacher_feature_pooling: str = "mean"
     task_count: int = 32768
     eval_task_count: int = 4096
     seed: int = 7
     device: str = "cuda"
-    output_dir: str = "artifacts/distillation_cache/gemma_e2b_l17"
+    output_dir: str = "artifacts/distillation_cache/gemma_e4b_l17"
     refinement_steps: int = 6
     teacher_probe_epochs: int = 5
     teacher_probe_learning_rate: float = 1e-3
@@ -54,7 +54,7 @@ class DistillationCacheConfig:
 
 @dataclass(frozen=True, slots=True)
 class DistillationConfig:
-    foundation_model_id: str = "google/gemma-4-e2b"
+    foundation_model_id: str = "google/gemma-4-e4b"
     teacher_layer_indices: tuple[int, ...] = (17,)
     teacher_feature_pooling: str = "mean"
     cache_dir: str | None = None

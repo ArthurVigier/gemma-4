@@ -15,9 +15,6 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader
 
-# Optimization: avoid memory fragmentation
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 try:
     from tqdm.auto import tqdm
 except Exception:
@@ -45,7 +42,7 @@ class TeacherMoEFinetuneConfig:
     lora_alpha: int = 16
     seed: int = 7
     output_dir: str = "artifacts/teacher_lora/gemma_26b_moe_arc_specialist"
-    max_length: int = 1024
+    max_length: int = 2048
     log_sample_every: int = 50
     real_data_path: str | None = None
     real_data_ratio: float = 0.0
@@ -230,6 +227,8 @@ def _parse_metrics_from_text(text: str) -> tuple[int | None, int | None]:
 
 
 def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
+    # Avoid memory fragmentation on CUDA allocator — scoped to training process only
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     set_seed(config.seed)
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -237,7 +236,7 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
 
     AutoModelForImageTextToText, AutoProcessor, AutoTokenizer = _lazy_import_transformers()
     from peft import LoraConfig, get_peft_model
-    from transformers import BitsAndBytesConfig
+    from transformers import BitsAndBytesConfig, get_cosine_schedule_with_warmup
 
     print(f"--- MoE Ultra-Surgical Fine-tuning ---")
     print(f"Model: {config.foundation_model_id}")
@@ -258,7 +257,7 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         config.foundation_model_id,
         quantization_config=bnb_config,
         device_map="auto",
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation="sdpa",
         trust_remote_code=True,
     )
@@ -321,7 +320,20 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
     eval_loader = DataLoader(eval_dataset, batch_size=config.batch_size, shuffle=False)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    try:
+        import bitsandbytes as bnb
+        optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=config.learning_rate)
+        print("Optimizer: AdamW 8-bit (paged, memory-efficient)")
+    except ImportError:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+        print("Optimizer: AdamW (bitsandbytes not available)")
+
+    total_steps = (len(train_loader) // config.gradient_accumulation_steps) * config.epochs
+    warmup_steps = max(1, int(total_steps * 0.05))
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    )
+    print(f"LR scheduler: cosine with {warmup_steps} warmup steps over {total_steps} total steps")
 
     print(f"\n--- Starting Hybrid Multimodal Fine-tuning (Surgical MoE) ---")
     best_eval_loss = float("inf")
@@ -346,31 +358,49 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
             loss.backward()
             
             if ((batch_idx + 1) % config.gradient_accumulation_steps == 0) or (batch_idx + 1 == len(train_loader)):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad()
             
             total_train_loss += (loss.item() * config.gradient_accumulation_steps)
 
             with torch.no_grad():
                 idx = 0
-                logits = outputs.logits[idx]
-                target_ids = batch["labels"][idx]
-                valid_mask = target_ids != -100
+                logits = outputs.logits[idx]          # (seq_len, vocab)
+                target_ids = batch["labels"][idx]      # (seq_len,)
+                # Causal LM: logits[i] predicts token[i+1] — apply shift before masking.
+                shifted_logits = logits[:-1]           # (seq_len-1, vocab)
+                shifted_labels = target_ids[1:]        # (seq_len-1,)
+                valid_mask = shifted_labels != -100
+                supervised_count = int(valid_mask.sum().item())
                 if valid_mask.any():
-                    pred_ids = torch.argmax(logits, dim=-1)[valid_mask]
-                    true_ids = target_ids[valid_mask]
+                    pred_ids = torch.argmax(shifted_logits, dim=-1)[valid_mask]
+                    true_ids = shifted_labels[valid_mask]
                     pred_text = processor.tokenizer.decode(pred_ids, skip_special_tokens=True)
                     true_text = processor.tokenizer.decode(true_ids, skip_special_tokens=True)
                     p_action, _ = _parse_metrics_from_text(pred_text)
                     t_action, _ = _parse_metrics_from_text(true_text)
-                    if p_action == t_action: correct_actions += 1
+                    # Guard: None == None would be a false positive when "Action:" was truncated
+                    if p_action is not None and p_action == t_action:
+                        correct_actions += 1
                     total_processed += 1
 
                     if batch_idx % config.log_sample_every == 0:
-                        tqdm.write(f"\n[Batch {batch_idx}] Loss: {(loss.item() * config.gradient_accumulation_steps):.4f} | Acc: {(correct_actions/total_processed*100):.1f}%")
+                        lr_now = scheduler.get_last_lr()[0]
+                        tqdm.write(
+                            f"\n[Batch {batch_idx}] Loss: {(loss.item() * config.gradient_accumulation_steps):.4f}"
+                            f" | Acc: {(correct_actions/total_processed*100):.1f}%"
+                            f" | supervised_tokens: {supervised_count}"
+                            f" | lr: {lr_now:.2e}"
+                        )
 
             act_acc = (correct_actions / total_processed * 100) if total_processed > 0 else 0
-            pbar.set_postfix({"loss": f"{(loss.item()*config.gradient_accumulation_steps):.2f}", "acc": f"{act_acc:.1f}%"})
+            pbar.set_postfix({
+                "loss": f"{(loss.item()*config.gradient_accumulation_steps):.4f}",
+                "acc": f"{act_acc:.1f}%",
+                "sup_tok": supervised_count if valid_mask.any() else "?",
+            })
 
         avg_train_loss = total_train_loss / len(train_loader)
         

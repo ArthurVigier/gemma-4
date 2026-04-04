@@ -37,7 +37,7 @@ ACTION_VOCABULARY: tuple[DroneAction, ...] = (
 class StudentTrainingConfig:
     """Configuration for student training on ARC-Drone-Bench."""
 
-    foundation_model_id: str = "google/gemma-4-e2b"
+    foundation_model_id: str = "google/gemma-4-e4b"
     task_count: int = 4096
     eval_task_count: int = 512
     batch_size: int = 32
