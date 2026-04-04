@@ -627,9 +627,11 @@ class ARCDroneBench:
             transform = meta.get("transform", "unknown")
             label = meta.get("action_label", "?")
             density = meta.get("density", "?")
+            h_imb = meta.get("horiz_imbalance", "?")
+            v_imb = meta.get("vert_imbalance", "?")
             return (
-                f"Reasoning: Symmetry task. Transform={transform}, grid density={density}. "
-                f"Mass distribution determines the correction direction. "
+                f"Reasoning: Symmetry task. horiz_imbalance={h_imb}, vert_imbalance={v_imb}, density={density}. "
+                f"Dominant imbalance axis determines transform={transform}. "
                 f"Predicted drone action: {label}."
             )
         if family == "counting":
@@ -666,34 +668,30 @@ class ARCDroneBench:
 
     def _make_symmetry_task(self, rng: np.random.Generator, index: int) -> BenchmarkTask:
         grid = self._random_grid(rng)
-        transform_choice = int(rng.integers(0, 4))
+        h, w = grid.shape
 
-        if transform_choice == 0:  # horizontal mirror
+        # Transform type is derived from the grid's own mass imbalance — fully inferable by the model.
+        left_mass = int(np.sum(grid[:, :w // 2] > 0))
+        right_mass = int(np.sum(grid[:, w // 2:] > 0))
+        top_mass = int(np.sum(grid[:h // 2, :] > 0))
+        bottom_mass = int(np.sum(grid[h // 2:, :] > 0))
+        horiz_imbalance = abs(left_mass - right_mass)
+        vert_imbalance = abs(top_mass - bottom_mass)
+
+        if horiz_imbalance >= vert_imbalance:
             target = np.fliplr(grid)
-            left_mass = int(np.sum(grid[:, :grid.shape[1] // 2] > 0))
-            right_mass = int(np.sum(grid[:, grid.shape[1] // 2:] > 0))
+            transform_name = "mirror_horizontal"
             if left_mass >= right_mass:
                 vel, yaw, action_label = (0.0, 0.3, 0.0), 0.0, "east"
             else:
                 vel, yaw, action_label = (0.0, -0.3, 0.0), 0.0, "west"
-            transform_name = "mirror_horizontal"
-        elif transform_choice == 1:  # vertical mirror
+        else:
             target = np.flipud(grid)
-            top_mass = int(np.sum(grid[:grid.shape[0] // 2, :] > 0))
-            bottom_mass = int(np.sum(grid[grid.shape[0] // 2:, :] > 0))
+            transform_name = "mirror_vertical"
             if bottom_mass >= top_mass:
                 vel, yaw, action_label = (0.3, 0.0, 0.0), 0.0, "north"
             else:
                 vel, yaw, action_label = (-0.3, 0.0, 0.0), 0.0, "south"
-            transform_name = "mirror_vertical"
-        elif transform_choice == 2:  # 90° CCW
-            target = np.rot90(grid, k=1)
-            vel, yaw, action_label = (0.0, 0.0, 0.0), -0.25, "yaw_neg"
-            transform_name = "rotate_90_ccw"
-        else:  # 90° CW
-            target = np.rot90(grid, k=3)
-            vel, yaw, action_label = (0.0, 0.0, 0.0), 0.25, "yaw_pos"
-            transform_name = "rotate_90_cw"
 
         density = float(np.mean(grid > 0))
         halt_prob = round(float(np.clip(0.82 + 0.15 * density, 0.82, 0.97)), 3)
@@ -702,7 +700,13 @@ class ARCDroneBench:
             action=DroneAction(vel, yaw, halt_prob),
             target_zone=TargetZone((0.0, 1.2, -1.5), 0.45),
             target_entity_name=default_target_entity_name("symmetry"),
-            metadata={"transform": transform_name, "action_label": action_label, "density": round(density, 3)},
+            metadata={
+                "transform": transform_name,
+                "action_label": action_label,
+                "density": round(density, 3),
+                "horiz_imbalance": horiz_imbalance,
+                "vert_imbalance": vert_imbalance,
+            },
         )
 
     def _make_counting_task(self, rng: np.random.Generator, index: int) -> BenchmarkTask:
