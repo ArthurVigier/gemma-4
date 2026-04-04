@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+from PIL import Image
 
 from arc_drone.arc_types import ArcGrid, BenchmarkTask, DroneAction
 from arc_drone.teacher_finetuning_moe import TeacherMoEHybridDataset
@@ -73,6 +74,7 @@ def test_teacher_moe_dataset_uses_chat_template_for_multimodal_prompt() -> None:
         target_action=DroneAction((0.3, 0.0, 0.0), yaw_rate=0.0, halt_probability=0.9),
         metadata={
             "reasoning_trace": "Reasoning: Counting task. Use the object density to choose the action.",
+            "pil_image": Image.fromarray(np.full((4, 4, 3), 255, dtype=np.uint8), mode="RGB"),
             "isaac_scene": {
                 "entities": [
                     {

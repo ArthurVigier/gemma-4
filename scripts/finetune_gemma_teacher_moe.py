@@ -24,6 +24,15 @@ def main() -> None:
     parser.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha.")
     parser.add_argument("--seed", type=int, default=7, help="Random seed.")
     parser.add_argument("--output-dir", type=str, default="artifacts/teacher_lora/gemma_26b_moe_arc_specialist", help="Output directory for LoRA adapters.")
+    parser.add_argument("--real-data-path", type=str, default=None, help="Local JSON/JSONL manifest of real tasks to mix in.")
+    parser.add_argument("--real-data-ratio", type=float, default=0.0, help="Fraction of the task pool sourced from real data.")
+    parser.add_argument(
+        "--real-dataset",
+        type=str,
+        default=None,
+        help="Direct real dataset preset or HF dataset id. Built-in presets: visdrone_det, drone_detection.",
+    )
+    parser.add_argument("--real-dataset-split", type=str, default="train", help="Split to read from the direct real dataset source.")
 
     args = parser.parse_args()
 
@@ -39,6 +48,10 @@ def main() -> None:
         lora_alpha=args.lora_alpha,
         seed=args.seed,
         output_dir=args.output_dir,
+        real_data_path=args.real_data_path,
+        real_data_ratio=args.real_data_ratio,
+        real_dataset=args.real_dataset,
+        real_dataset_split=args.real_dataset_split,
     )
 
     print(f"Starting QLoRA fine-tuning for {config.foundation_model_id} (MoE)...")

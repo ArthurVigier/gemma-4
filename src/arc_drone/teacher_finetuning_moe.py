@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,10 @@ class TeacherMoEFinetuneConfig:
     output_dir: str = "artifacts/teacher_lora/gemma_26b_moe_arc_specialist"
     max_length: int = 1024
     log_sample_every: int = 50
+    real_data_path: str | None = None
+    real_data_ratio: float = 0.0
+    real_dataset: str | None = None
+    real_dataset_split: str = "train"
 
 
 class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]]):
@@ -64,6 +69,17 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
 
     def __len__(self) -> int:
         return len(self.tasks)
+
+    def _resolve_task_image(self, task: Any) -> Image.Image:
+        pil_image = task.metadata.get("pil_image")
+        if isinstance(pil_image, Image.Image):
+            return pil_image.convert("RGB")
+
+        image_path = task.metadata.get("image_path")
+        if image_path:
+            return Image.open(str(image_path)).convert("RGB")
+
+        return grid_to_image(task.input_grid.values)
 
     def _format_isaac_world_state(self, isaac_scene: dict[str, Any]) -> str:
         """Converts the Isaac Sim scene descriptor into compact text for the LLM."""
@@ -95,7 +111,7 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         task = self.tasks[index]
-        image = grid_to_image(task.input_grid.values)
+        image = self._resolve_task_image(task)
         text_grid = serialize_task_for_teacher(task)
         world_state = self._format_isaac_world_state(task.metadata.get("isaac_scene", {}))
         messages = [
@@ -240,8 +256,30 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
     model.print_trainable_parameters()
 
     print("\nGenerating ARC-Drone tasks for fine-tuning...")
-    train_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed)).generate_tasks(augment=True)
-    eval_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1)).generate_tasks(augment=True)
+    train_bench_config = BenchmarkConfig(
+        task_count=config.task_count,
+        seed=config.seed,
+        real_data_path=config.real_data_path,
+        real_data_ratio=config.real_data_ratio,
+        real_dataset=config.real_dataset,
+        real_dataset_split=config.real_dataset_split,
+    )
+    eval_bench_config = BenchmarkConfig(
+        task_count=config.eval_task_count,
+        seed=config.seed + 1,
+        real_data_path=config.real_data_path,
+        real_data_ratio=config.real_data_ratio,
+        real_dataset=config.real_dataset,
+        real_dataset_split=config.real_dataset_split,
+    )
+    train_tasks = ARCDroneBench(train_bench_config).generate_tasks(augment=True)
+    eval_tasks = ARCDroneBench(eval_bench_config).generate_tasks(augment=True)
+    train_sources = Counter(str(task.metadata.get("source_type", "unknown")) for task in train_tasks)
+    eval_sources = Counter(str(task.metadata.get("source_type", "unknown")) for task in eval_tasks)
+    dataset_version = next((str(task.metadata.get("dataset_version")) for task in train_tasks if "dataset_version" in task.metadata), "unknown")
+    print(f"Dataset version: {dataset_version}")
+    print(f"Train source mix: {dict(train_sources)}")
+    print(f"Eval source mix: {dict(eval_sources)}")
 
     train_dataset = TeacherMoEHybridDataset(train_tasks, processor, config.max_length)
     eval_dataset = TeacherMoEHybridDataset(eval_tasks, processor, config.max_length)

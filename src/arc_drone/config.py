@@ -35,6 +35,12 @@ class BenchmarkConfig:
     seed: int = 7
     latency_budget_ms: float = 80.0
     energy_budget_joules: float = 2.5
+    real_data_path: str | None = None
+    real_data_ratio: float = 0.0
+    real_dataset: str | None = None
+    real_dataset_split: str = "train"
+    auto_discover_real_data: bool = True
+    dataset_version: str = "arc_drone_v3_hybrid_auto"
     task_families: tuple[str, ...] = (
         "symmetry",
         "counting",
