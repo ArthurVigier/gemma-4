@@ -91,6 +91,88 @@ class StudentTrainingSummary:
     trtexec_command: list[str] | None
 
 
+class AuAirStudentDataset(Dataset[dict[str, torch.Tensor]]):
+    """Dataset built from AU-AIR temporal sequences (parse_auair.py output).
+
+    Converts real drone images to ARC-style grids via the vision pipeline,
+    then returns (grids, action_indices, halt_steps) tensors with true
+    temporal motion signal across T consecutive frames.
+    """
+
+    def __init__(
+        self,
+        jsonl_path: Path,
+        reasoner_config: ReasonerConfig,
+        grid_height: int = 30,
+        grid_width: int = 30,
+    ) -> None:
+        self.reasoner_config = reasoner_config
+        self.grid_height = grid_height
+        self.grid_width = grid_width
+
+        self.records: list[dict] = []
+        with open(jsonl_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    self.records.append(json.loads(line))
+
+    def __len__(self) -> int:
+        return len(self.records)
+
+    def _image_to_grid(self, image_path: str) -> np.ndarray:
+        from PIL import Image as PILImage
+        img = PILImage.open(image_path).convert("RGB")
+        img = img.resize((self.grid_width, self.grid_height))
+        arr = np.asarray(img, dtype=np.float32)
+        # Map RGB → ARC color index (0-9) via channel binning
+        channel_bins = np.floor(arr / 85.334).astype(np.int64)
+        grid = (channel_bins[:, :, 0] + 3 * channel_bins[:, :, 1] + 5 * channel_bins[:, :, 2]) % 10
+        return grid.astype(np.int64)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        rec = self.records[index]
+        T = self.reasoner_config.temporal_window
+        C = self.reasoner_config.action_chunk_size
+
+        image_paths = rec["image_paths"]
+        # Pad or truncate to exactly T frames
+        if len(image_paths) < T:
+            image_paths = [image_paths[0]] * (T - len(image_paths)) + image_paths
+        image_paths = image_paths[-T:]
+
+        grids = torch.stack([
+            torch.tensor(self._image_to_grid(p), dtype=torch.long)
+            for p in image_paths
+        ])  # (T, H, W)
+
+        action_indices_raw = rec.get("action_indices", [rec["action_index"]] * C)
+        halt_steps_raw = rec.get("halt_steps", [rec["halt_step"]] * C)
+        # Pad/truncate to chunk_size
+        action_indices_raw = (action_indices_raw * C)[:C]
+        halt_steps_raw = (halt_steps_raw * C)[:C]
+
+        action_indices = torch.tensor(action_indices_raw, dtype=torch.long)
+        action_target_vectors = torch.stack([
+            action_to_vector(ACTION_VOCABULARY[a]) for a in action_indices_raw
+        ])  # (C, 4)
+
+        # Halt targets from the first chunk step
+        halt_step = int(halt_steps_raw[0])
+        halt_targets = build_halt_targets(
+            halt_step=halt_step,
+            refinement_steps=self.reasoner_config.refinement_steps,
+        )
+
+        return {
+            "grids": grids,
+            "action_indices": action_indices,
+            "action_target_vectors": action_target_vectors,
+            "halt_targets": halt_targets,
+            "halt_step": torch.tensor(halt_step, dtype=torch.long),
+        }
+
+
 class ArcStudentDataset(Dataset[dict[str, torch.Tensor]]):
     """Torch dataset built from synthetic ARC benchmark tasks.
 
