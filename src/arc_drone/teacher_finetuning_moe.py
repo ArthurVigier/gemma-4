@@ -25,7 +25,7 @@ except Exception:
 
 from .arc_drone_bench import ARCDroneBench
 from .config import BenchmarkConfig
-from .gemma_layer_sweep import _lazy_import_transformers, serialize_task_for_teacher
+from .gemma_layer_sweep import _lazy_import_transformers
 from .student_training import action_to_index, halt_probability_to_step, select_device, set_seed
 from .teacher_finetuning import grid_to_image
 
@@ -39,61 +39,79 @@ class TeacherMoEFinetuneConfig:
     batch_size: int = 1
     gradient_accumulation_steps: int = 16
     epochs: int = 2
-    learning_rate: float = 2e-5  # Radical reduction to prevent parrot-style overfitting
+    learning_rate: float = 2e-5
     lora_r: int = 16 
     lora_alpha: int = 32
     seed: int = 7
     output_dir: str = "artifacts/teacher_lora/gemma_26b_moe_arc_specialist"
-    max_length: int = 1280 
+    max_length: int = 1536  # Increased to hold the Isaac World State Descriptor
     log_sample_every: int = 100
 
 
-
 class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]]):
-    """Dataset providing ALL keys required by the Gemma-4 multimodal processor."""
+    """Dataset providing ALL keys with Reasoning Traces and Isaac Sim World States."""
 
     def __init__(self, tasks: list[Any], processor: Any, max_length: int) -> None:
         self.tasks = tasks
         self.processor = processor
-        image_seq_length = getattr(processor, "image_seq_length", 280)
-        try:
-            self.image_seq_length = int(image_seq_length)
-        except (TypeError, ValueError):
-            self.image_seq_length = 280
-        # Reserve space for the processor's configured image token expansion.
-        self.max_length = max_length + self.image_seq_length
+        self.max_length = max_length + 256
 
     def __len__(self) -> int:
         return len(self.tasks)
 
+    def _format_isaac_world_state(self, isaac_scene: dict[str, Any]) -> str:
+        """Converts the Isaac Sim JSON descriptor into a compact text format for the LLM."""
+        if not isaac_scene or "entities" not in isaac_scene:
+            return "World State: Unknown"
+            
+        lines = ["Isaac Sim World State (NED Coordinates):"]
+        # Cap the number of entities printed to avoid massive prompts
+        entities = isaac_scene["entities"]
+        if len(entities) > 30:
+            lines.append(f"({len(entities)} objects detected. Showing bounding box summaries...)")
+            entities = entities[:30]
+            
+        for ent in entities:
+            pos = ent["position"]
+            lines.append(f"- {ent[semantics][id]}: {ent[material]} {ent[prim_type]} at N:{pos[0]:.2f}m, E:{pos[1]:.2f}m, D:{pos[2]:.2f}m")
+            
+        return "\\n".join(lines)
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         task = self.tasks[index]
         image = grid_to_image(task.input_grid.values)
-        text_grid = serialize_task_for_teacher(task)
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": f"{text_grid}\nPredict the best drone action family and halting step."},
-                ],
-            }
-        ]
+        
+        # 1. Logic Representation (Text Grid)
+        lines = []
+        for y in range(task.input_grid.values.shape[0]):
+            lines.append("".join(str(val) for val in task.input_grid.values[y]))
+        text_grid = "\\n".join(lines)
+
+        # 2. Physics Representation (Isaac Sim NED Coordinates)
+        world_state = self._format_isaac_world_state(task.metadata.get("isaac_scene", {}))
+        
+        reasoning_trace = task.metadata.get("reasoning_trace", "Analyze the pattern.")
+
+        # MANUAL OVERRIDE: 256 image tokens
+        image_tokens = "<image>" * 256
+        
+        # JOINT EMBEDDING PROMPT: Vision + Physics + Logic
+        prompt = (
+            f"User:\\n{image_tokens}\\n\\n"
+            f"--- PHYSICAL SENSORS ---\\n"
+            f"{world_state}\\n\\n"
+            f"--- LOGICAL GRID ---\\n"
+            f"{text_grid}\\n\\n"
+            f"Identify the spatial transformation rule and predict the drone action index (0-7) and halting step (1-6).\\n"
+            f"Assistant: Reasoning: "
+        )
 
         action_idx = action_to_index(task.target_action)
         halt_step = halt_probability_to_step(halt_probability=task.target_action.halt_probability, refinement_steps=6)
-        answer = f"Action: {action_idx}, Halt: {halt_step}"
+        answer = f"{reasoning_trace} Result: Action {action_idx}, Halt {halt_step}"
 
-        prompt = self.processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-        # Combine for full input
         full_text = prompt + answer + self.processor.tokenizer.eos_token
 
-        # Use the processor to handle both image and text simultaneously
         try:
             inputs = self.processor(
                 text=full_text,
@@ -115,7 +133,6 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
 
         payload = {k: v.squeeze(0) for k, v in inputs.items()}
 
-        # Masking labels for the prompt part
         try:
             prompt_inputs = self.processor(
                 text=prompt,
@@ -137,8 +154,8 @@ class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]])
 
 def _parse_metrics_from_text(text: str) -> tuple[int | None, int | None]:
     try:
-        action_match = re.search(r"Action:\s*(\d+)", text)
-        halt_match = re.search(r"Halt:\s*(\d+)", text)
+        action_match = re.search(r"Action\\s*(\\d+)", text)
+        halt_match = re.search(r"Halt\\s*(\\d+)", text)
         action = int(action_match.group(1)) if action_match else None
         halt = int(halt_match.group(1)) if halt_match else None
         return action, halt
@@ -156,14 +173,14 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
     from peft import LoraConfig, get_peft_model
     from transformers import BitsAndBytesConfig
 
-    print(f"--- MoE Ultra-Surgical Fine-tuning ---")
+    print(f"--- MoE Robust specialist Fine-tuning ---")
     print(f"Model: {config.foundation_model_id}")
     print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
     
-    print("\nLoading Multimodal Processor...")
+    print("\\nLoading Multimodal Processor...")
     processor = AutoProcessor.from_pretrained(config.foundation_model_id, trust_remote_code=True)
     
-    print("Loading Gemma MoE in 4-bit with SDPA attention...")
+    print("Loading Gemma MoE in 4-bit with Flash Attention 2...")
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -176,24 +193,18 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         quantization_config=bnb_config,
         device_map="auto",
         torch_dtype=torch.bfloat16,
-        attn_implementation="sdpa",
+        attn_implementation="flash_attention_2",
         trust_remote_code=True,
     )
     
-    # --- MANUAL PEFT PREPARATION ---
     print("Preparing model for training (BFloat16 mode)...")
     model.gradient_checkpointing_enable()
     
-    # Freeze all base parameters
     for param in model.parameters():
         param.requires_grad = False
-        
-    # Cast LM head or float32 anomalies to bfloat16
-    for param in model.parameters():
         if param.dtype == torch.float32:
             param.data = param.data.to(torch.bfloat16)
 
-    # Use the official PEFT shortcut "all-linear" to auto-discover all MoE layers 
     lora_config = LoraConfig(
         r=config.lora_r,
         lora_alpha=config.lora_alpha,
@@ -204,16 +215,17 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
     
     model = get_peft_model(model, lora_config)
     
-    # Ensure newly injected LoRA parameters are also bfloat16
     for name, param in model.named_parameters():
         if "lora" in name:
             param.data = param.data.to(torch.bfloat16)
 
     model.print_trainable_parameters()
 
-    print("\nGenerating ARC-Drone tasks for fine-tuning...")
-    train_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed)).generate_tasks()
-    eval_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1)).generate_tasks()
+    print("\\nGenerating augmented ARC-Drone tasks...")
+    bench = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed))
+    train_tasks = bench.generate_tasks(augment=True)
+    eval_bench = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1))
+    eval_tasks = eval_bench.generate_tasks(augment=True)
 
     train_dataset = TeacherMoEHybridDataset(train_tasks, processor, config.max_length)
     eval_dataset = TeacherMoEHybridDataset(eval_tasks, processor, config.max_length)
@@ -221,9 +233,9 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
     eval_loader = DataLoader(eval_dataset, batch_size=config.batch_size, shuffle=False)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=0.1)
 
-    print(f"\n--- Starting Hybrid Multimodal Fine-tuning (Surgical MoE) ---")
+    print(f"\\n--- Starting Hybrid Fine-tuning (CoT + Augmentation + Isaac) ---")
     best_eval_loss = float("inf")
 
     for epoch in range(1, config.epochs + 1):
@@ -236,7 +248,6 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs} [Train]")
         for batch_idx, batch in enumerate(pbar):
-            # Move all batch dict items to device
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             if "pixel_values" in batch:
                 batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
@@ -268,7 +279,9 @@ def finetune_teacher_moe(config: TeacherMoEFinetuneConfig) -> dict[str, Any]:
                     total_processed += 1
 
                     if batch_idx % config.log_sample_every == 0:
-                        tqdm.write(f"\n[Batch {batch_idx}] Loss: {(loss.item() * config.gradient_accumulation_steps):.4f} | Acc: {(correct_actions/total_processed*100):.1f}%")
+                        tqdm.write(f"\\n[Batch {batch_idx}] Loss: {(loss.item() * config.gradient_accumulation_steps):.4f} | Acc: {(correct_actions/total_processed*100):.1f}%")
+                        tqdm.write(f"  GT:   {true_text.strip()}")
+                        tqdm.write(f"  Pred: {pred_text.strip()}")
 
             act_acc = (correct_actions / total_processed * 100) if total_processed > 0 else 0
             pbar.set_postfix({"loss": f"{(loss.item()*config.gradient_accumulation_steps):.2f}", "acc": f"{act_acc:.1f}%"})
