@@ -58,6 +58,8 @@ class StudentTrainingConfig:
     action_loss_weight: float = 2.0
     action_regression_weight: float = 0.5
     halt_loss_weight: float = 0.5
+    temporal_window: int = 4
+    action_chunk_size: int = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +92,18 @@ class StudentTrainingSummary:
 
 
 class ArcStudentDataset(Dataset[dict[str, torch.Tensor]]):
-    """Torch dataset built from synthetic ARC benchmark tasks."""
+    """Torch dataset built from synthetic ARC benchmark tasks.
+
+    Returns:
+        grids: (T, H, W) — temporal window of frames.
+               For synthetic tasks the same grid is repeated T times (no motion).
+               For real video sequences, consecutive frames are stacked here.
+        action_indices: (chunk_size,) — action chunk targets.
+               For synthetic tasks the same action is repeated chunk_size times.
+        action_target_vectors: (chunk_size, 4) — dense control vectors per chunk step.
+        halt_targets: (refinement_steps,) — unchanged, for the current step only.
+        halt_step: scalar.
+    """
 
     def __init__(self, tasks: list[BenchmarkTask], reasoner_config: ReasonerConfig) -> None:
         self.tasks = tasks
@@ -105,10 +118,23 @@ class ArcStudentDataset(Dataset[dict[str, torch.Tensor]]):
             halt_probability=task.target_action.halt_probability,
             refinement_steps=self.reasoner_config.refinement_steps,
         )
+        T = self.reasoner_config.temporal_window
+        C = self.reasoner_config.action_chunk_size
+
+        grid = torch.tensor(task.input_grid.values, dtype=torch.long)
+        # Repeat single frame T times — architecture-ready, motion=0 for synthetic data.
+        grids = grid.unsqueeze(0).expand(T, -1, -1)  # (T, H, W)
+
+        action_idx = action_to_index(task.target_action)
+        action_vec = action_to_vector(task.target_action)
+        # Repeat same action C times — for synthetic data all chunk steps are identical.
+        action_indices = torch.full((C,), action_idx, dtype=torch.long)
+        action_target_vectors = action_vec.unsqueeze(0).expand(C, -1)  # (C, 4)
+
         return {
-            "grid": torch.tensor(task.input_grid.values, dtype=torch.long),
-            "action_index": torch.tensor(action_to_index(task.target_action), dtype=torch.long),
-            "action_target_vector": action_to_vector(task.target_action),
+            "grids": grids,
+            "action_indices": action_indices,
+            "action_target_vectors": action_target_vectors,
             "halt_targets": build_halt_targets(
                 halt_step=halt_step,
                 refinement_steps=self.reasoner_config.refinement_steps,
@@ -177,6 +203,8 @@ def build_reasoner_config(config: StudentTrainingConfig) -> ReasonerConfig:
         hidden_size=config.hidden_size,
         refinement_steps=config.refinement_steps,
         halting_threshold=config.halting_threshold,
+        temporal_window=config.temporal_window,
+        action_chunk_size=config.action_chunk_size,
     )
 
 
@@ -253,29 +281,52 @@ def compute_loss(
     device: torch.device,
     config: StudentTrainingConfig,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Computes the combined action and halting loss."""
+    """Computes the combined action-chunk and halting loss.
 
-    grid = batch["grid"].to(device)
-    action_index = batch["action_index"].to(device)
-    action_target_vector = batch["action_target_vector"].to(device)
+    Action loss is averaged over the chunk dimension so that all future
+    timesteps contribute equally to the gradient.
+    """
+
+    grids = batch["grids"].to(device)                           # (B, T, H, W)
+    action_indices = batch["action_indices"].to(device)         # (B, C)
+    action_target_vectors = batch["action_target_vectors"].to(device)  # (B, C, 4)
     halt_targets = batch["halt_targets"].to(device)
     halt_step = batch["halt_step"].to(device)
 
-    output = model(grid)
-    action_loss = F.cross_entropy(output.action_logits, action_index)
-    action_probabilities = output.action_logits.softmax(dim=-1)
-    expected_action = action_probabilities @ action_vocabulary_tensor(device=device)
-    action_regression_loss = F.smooth_l1_loss(expected_action, action_target_vector)
+    output = model(grids)
+    # output.action_chunk_logits: (B, C, action_dim)
+
+    B, C, A = output.action_chunk_logits.shape
+    vocab = action_vocabulary_tensor(device=device)             # (A, 4)
+
+    # Cross-entropy over all chunk steps: reshape to (B*C, A) vs (B*C,)
+    action_loss = F.cross_entropy(
+        output.action_chunk_logits.reshape(B * C, A),
+        action_indices.reshape(B * C),
+    )
+
+    # Regression: expected continuous action per chunk step
+    action_probs = output.action_chunk_logits.softmax(dim=-1)  # (B, C, A)
+    expected_actions = action_probs @ vocab                     # (B, C, 4)
+    action_regression_loss = F.smooth_l1_loss(expected_actions, action_target_vectors)
+
     halt_supervision = halt_targets.argmax(dim=-1)
     halt_loss = F.cross_entropy(output.halt_logits, halt_supervision)
+
     total_loss = (
         config.action_loss_weight * action_loss
         + config.action_regression_weight * action_regression_loss
         + config.halt_loss_weight * halt_loss
     )
 
-    action_accuracy = float((output.action_logits.argmax(dim=-1) == action_index).float().mean().item())
-    halt_step_mae = float(torch.mean(torch.abs(output.halted_at_step.float() - halt_step.float())).item())
+    # Accuracy measured on the first (current) chunk step only
+    current_action_logits = output.action_chunk_logits[:, 0, :]  # (B, A)
+    action_accuracy = float(
+        (current_action_logits.argmax(dim=-1) == action_indices[:, 0]).float().mean().item()
+    )
+    halt_step_mae = float(
+        torch.mean(torch.abs(output.halted_at_step.float() - halt_step.float())).item()
+    )
     return total_loss, {
         "action_loss": float(action_loss.item()),
         "action_regression_loss": float(action_regression_loss.item()),

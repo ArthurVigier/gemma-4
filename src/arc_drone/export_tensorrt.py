@@ -18,9 +18,9 @@ class _OnnxReasonerWrapper(nn.Module):
         super().__init__()
         self.model = model
 
-    def forward(self, grid: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        output = self.model(grid)
-        return output.action_logits, output.halt_probabilities, output.halted_at_step
+    def forward(self, grids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        output = self.model(grids)
+        return output.action_chunk_logits, output.halt_probabilities, output.halted_at_step
 
 
 def export_reasoner_to_onnx(
@@ -52,6 +52,7 @@ def export_reasoner_model_to_onnx(
     reasoner_config = model.model.config
     dummy = torch.zeros(
         1,
+        reasoner_config.temporal_window,
         reasoner_config.grid_height,
         reasoner_config.grid_width,
         dtype=torch.long,
@@ -63,8 +64,8 @@ def export_reasoner_model_to_onnx(
         model,
         dummy,
         output_path.as_posix(),
-        input_names=["grid"],
-        output_names=["action_logits", "halt_probabilities", "halted_at_step"],
+        input_names=["grids"],
+        output_names=["action_chunk_logits", "halt_probabilities", "halted_at_step"],
         dynamic_axes=deployment_config.dynamic_axes,
         opset_version=deployment_config.onnx_opset,
     )

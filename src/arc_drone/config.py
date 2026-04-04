@@ -23,6 +23,12 @@ class ReasonerConfig:
     refinement_steps: int = 6
     halting_threshold: float = 0.82
     action_dim: int = 8
+    # Temporal video context: number of consecutive frames fed per inference.
+    # T=1 reduces to the original single-frame behaviour.
+    temporal_window: int = 4
+    # Action chunking: number of future timesteps predicted in one forward pass.
+    # chunk=1 reduces to the original single-action behaviour.
+    action_chunk_size: int = 4
 
 
 @dataclass(slots=True)
@@ -60,8 +66,8 @@ class DeploymentConfig:
     secondary_simulator: str = "airsim"
     dynamic_axes: dict[str, dict[int, str]] = field(
         default_factory=lambda: {
-            "grid": {0: "batch"},
-            "action_logits": {0: "batch"},
+            "grids": {0: "batch", 1: "temporal_window"},
+            "action_chunk_logits": {0: "batch"},
             "halt_probabilities": {0: "batch"},
         }
     )
