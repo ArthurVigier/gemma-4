@@ -33,19 +33,20 @@ from .teacher_finetuning import grid_to_image
 @dataclass(frozen=True, slots=True)
 class TeacherMoEFinetuneConfig:
     """Configuration optimized for the 26B-A4B Mixture-of-Experts model."""
-    foundation_model_id: str = "google/gemma-4-26B-A4B-it"
-    task_count: int = 25000
-    eval_task_count: int = 1000
+    foundation_model_id: str = "google/gemma-4-26b-a4b"
+    task_count: int = 15000 
+    eval_task_count: int = 500
     batch_size: int = 1
     gradient_accumulation_steps: int = 16
     epochs: int = 2
-    learning_rate: float = 5e-5
-    lora_r: int = 8
-    lora_alpha: int = 16
+    learning_rate: float = 2e-5  # Radical reduction to prevent parrot-style overfitting
+    lora_r: int = 16 
+    lora_alpha: int = 32
     seed: int = 7
     output_dir: str = "artifacts/teacher_lora/gemma_26b_moe_arc_specialist"
-    max_length: int = 1024
-    log_sample_every: int = 50
+    max_length: int = 1280 
+    log_sample_every: int = 100
+
 
 
 class TeacherMoEHybridDataset(torch.utils.data.Dataset[dict[str, torch.Tensor]]):
