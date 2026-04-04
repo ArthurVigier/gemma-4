@@ -13,11 +13,12 @@ from arc_drone.teacher_finetuning import TeacherFinetuneConfig, finetune_teacher
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fine-tune Gemma-4 teacher model using QLoRA.")
-    parser.add_argument("--foundation-model-id", type=str, default="google/gemma-4-e2b-it", help="HF model ID.")
+    parser.add_argument("--foundation-model-id", type=str, default="google/gemma-4-e4b", help="HF model ID.")
     parser.add_argument("--task-count", type=int, default=25000, help="Number of training tasks.")
     parser.add_argument("--eval-task-count", type=int, default=1000, help="Number of evaluation tasks.")
     parser.add_argument("--batch-size", type=int, default=4, help="Training batch size.")
     parser.add_argument("--epochs", type=int, default=2, help="Number of epochs.")
+
     parser.add_argument("--learning-rate", type=float, default=2e-4, help="Learning rate.")
     parser.add_argument("--lora-r", type=int, default=16, help="LoRA rank.")
     parser.add_argument("--lora-alpha", type=int, default=32, help="LoRA alpha.")
