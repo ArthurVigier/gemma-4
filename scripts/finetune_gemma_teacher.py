@@ -13,7 +13,7 @@ from arc_drone.teacher_finetuning import TeacherFinetuneConfig, finetune_teacher
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Fine-tune Gemma-4 teacher model using QLoRA.")
-    parser.add_argument("--foundation-model-id", type=str, default="google/gemma-4-e4b", help="HF model ID.")
+    parser.add_argument("--foundation-model-id", type=str, default="google/gemma-4-e2b-it", help="HF model ID.")
     parser.add_argument("--task-count", type=int, default=25000, help="Number of training tasks.")
     parser.add_argument("--eval-task-count", type=int, default=1000, help="Number of evaluation tasks.")
     parser.add_argument("--batch-size", type=int, default=4, help="Training batch size.")

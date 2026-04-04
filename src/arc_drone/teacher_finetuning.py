@@ -63,7 +63,7 @@ class TeacherFinetuneConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     seed: int = 7
-    output_dir: str = "artifacts/teacher_lora/gemma_e4b_arc_specialist"
+    output_dir: str = "artifacts/teacher_lora/gemma_e2b_arc_specialist"
     max_length: int = 1024
     log_sample_every: int = 250
 
@@ -82,30 +82,51 @@ class TeacherHybridDataset(Dataset[dict[str, torch.Tensor]]):
     def __len__(self) -> int:
         return len(self.tasks)
 
+    def _supports_chat_template(self) -> bool:
+        processor_template = getattr(self.processor, "chat_template", None)
+        tokenizer_template = getattr(getattr(self.processor, "tokenizer", None), "chat_template", None)
+        return bool(processor_template or tokenizer_template)
+
+    def _image_placeholder_token(self) -> str:
+        for owner in (self.processor, getattr(self.processor, "tokenizer", None)):
+            if owner is None:
+                continue
+            token = getattr(owner, "image_token", None)
+            if token:
+                return str(token)
+        return "<|image|>"
+
+    def _build_prompt(self, text_grid: str) -> str:
+        task_prompt = f"{text_grid}\nPredict the best drone action family and halting step."
+        if self._supports_chat_template():
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": task_prompt},
+                    ],
+                }
+            ]
+            return self.processor.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+
+        # Fallback for base/non-chat checkpoints whose processors do not ship a chat template.
+        return f"{self._image_placeholder_token()}\n{task_prompt}\n"
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         task = self.tasks[index]
         image = grid_to_image(task.input_grid.values)
         text_grid = serialize_task_for_teacher(task)
-        
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": f"{text_grid}\nPredict the best drone action family and halting step."}
-                ]
-            }
-        ]
-        
+
         action_idx = action_to_index(task.target_action)
         halt_step = halt_probability_to_step(halt_probability=task.target_action.halt_probability, refinement_steps=6)
         answer = f"Action: {action_idx}, Halt: {halt_step}"
 
-        prompt = self.processor.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True
-        )
+        prompt = self._build_prompt(text_grid)
 
         full_text = prompt + answer + self.processor.tokenizer.eos_token
 
