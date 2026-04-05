@@ -26,10 +26,12 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default="artifacts/teacher_lora/gemma_e4b_arc_specialist", help="Output directory for LoRA adapters.")
     parser.add_argument("--real-data-path", type=str, default=None, help="Local JSON/JSONL manifest of real tasks.")
     parser.add_argument("--real-data-ratio", type=float, default=0.0, help="Fraction of tasks from real data.")
-    parser.add_argument("--real-dataset", type=str, default=None, help="HF dataset preset (e.g. visdrone).")
-    parser.add_argument("--real-dataset-split", type=str, default="train", help="Dataset split.")
-    parser.add_argument("--annotated-data-path", type=str, default=None, help="JSONL from annotate_visdrone.py.")
-    parser.add_argument("--annotated-data-ratio", type=float, default=1.0, help="Fraction of batch from annotated data.")
+    parser.add_argument("--real-dataset", type=str, default=None, help="HF dataset preset (legacy).")
+    parser.add_argument("--real-dataset-split", type=str, default="train", help="Dataset split (legacy).")
+    parser.add_argument("--auair-path", type=str, default=None,
+                        help="JSONL from annotate_auair.py (T-frame sequences with CoT + action chunk).")
+    parser.add_argument("--temporal-window", type=int, default=4, help="Number of input frames per sequence (T).")
+    parser.add_argument("--action-chunk-size", type=int, default=4, help="Number of future actions predicted (C).")
 
     args = parser.parse_args()
 
@@ -49,8 +51,9 @@ def main() -> None:
         real_data_ratio=args.real_data_ratio,
         real_dataset=args.real_dataset,
         real_dataset_split=args.real_dataset_split,
-        annotated_data_path=args.annotated_data_path,
-        annotated_data_ratio=args.annotated_data_ratio,
+        auair_path=args.auair_path,
+        temporal_window=args.temporal_window,
+        action_chunk_size=args.action_chunk_size,
     )
 
     print(f"Starting QLoRA fine-tuning for {config.foundation_model_id}...")

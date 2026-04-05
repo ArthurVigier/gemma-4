@@ -26,14 +26,20 @@ from .config import BenchmarkConfig
 from .gemma_layer_sweep import _lazy_import_transformers, serialize_task_for_teacher
 from .student_training import action_to_index, halt_probability_to_step, select_device, set_seed
 
-_ANNOTATION_USER_PROMPT = (
-    "Analyze this drone aerial image.\n\n"
-    "Step 1 — Describe what you see: object types, approximate count, spatial distribution.\n"
-    "Step 2 — Identify the dominant cluster: where is it in the frame?\n"
-    "Step 3 — Decide the action: which action best moves the drone toward the dominant cluster?\n"
-    "Step 4 — Assess confidence: how clear is the target? (1=very clear, 6=very ambiguous)\n\n"
-    "Then output:\nAction: <0-7>\nHalt: <1-6>"
-)
+def _temporal_user_prompt(T: int, C: int) -> str:
+    return (
+        f"You are an autonomous drone navigation assistant analyzing a sequence of {T} consecutive aerial frames.\n\n"
+        "Study the motion of objects across frames carefully before deciding.\n\n"
+        "Step 1 — Describe the scene in the FIRST frame: object types, count, spatial location.\n"
+        f"Step 2 — Track motion: how do objects move from frame 1 to frame {T}? "
+        "Estimate centroid drift (left/right/up/down) and whether the cluster is accelerating.\n"
+        f"Step 3 — Predict the next {C} drone actions: given the observed motion trajectory, "
+        "which actions should the drone take to follow or intercept the cluster?\n"
+        "Step 4 — Assess confidence for each action (1=very confident, 6=very uncertain).\n\n"
+        "Output EXACTLY in this format:\n"
+        + "\n".join(f"Action_{i}: <0-7>  Halt_{i}: <1-6>" for i in range(C))
+        + "\n\nAction index: 0=north 1=south 2=east 3=west 4=up 5=down 6=yaw_right 7=yaw_left"
+    )
 
 # Official ARC color palette
 ARC_COLORS = [
@@ -80,12 +86,12 @@ class TeacherFinetuneConfig:
     real_data_ratio: float = 0.0
     real_dataset: str | None = None
     real_dataset_split: str = "train"
-    # Path to a JSONL file produced by scripts/annotate_visdrone.py.
-    # When set, the model is fine-tuned on real drone annotations instead of
-    # (or mixed with) synthetic ARC tasks.
-    annotated_data_path: str | None = None
-    # Fraction of the batch drawn from annotated data when mixing with synthetic.
-    annotated_data_ratio: float = 1.0
+    # Path to JSONL produced by scripts/annotate_auair.py.
+    # When set, the model is fine-tuned on real AU-AIR temporal sequences
+    # (T frames → CoT + action chunk) instead of synthetic ARC tasks.
+    auair_path: str | None = None
+    temporal_window: int = 4
+    action_chunk_size: int = 4
 
 
 class TeacherHybridDataset(Dataset[dict[str, torch.Tensor]]):
@@ -179,14 +185,16 @@ class TeacherHybridDataset(Dataset[dict[str, torch.Tensor]]):
         return payload
 
 
-class AnnotatedDroneDataset(Dataset[dict[str, torch.Tensor]]):
-    """Dataset built from a JSONL file produced by scripts/annotate_visdrone.py.
+class TeacherVideoDataset(Dataset[dict[str, torch.Tensor]]):
+    """Dataset built from AU-AIR annotated sequences (annotate_auair.py output).
 
-    Each record must have:
-        - reasoning_trace: str  (CoT + "Action: X\\nHalt: Y")
-        - action_index: int
-        - halt_step: int
-        - (optional) image_b64: str  OR the HF dataset will be re-streamed lazily
+    Each record contains T consecutive frames + a CoT reasoning trace that
+    explicitly discusses object motion across frames + an action chunk of C steps.
+
+    The model learns to:
+      - receive T image tokens (Gemma video encoder handles temporal ordering)
+      - generate the CoT reasoning trace as supervised tokens
+      - output Action_0..Action_{C-1} and Halt_0..Halt_{C-1}
     """
 
     def __init__(
@@ -194,47 +202,28 @@ class AnnotatedDroneDataset(Dataset[dict[str, torch.Tensor]]):
         jsonl_path: Path,
         processor: Any,
         max_length: int,
-        *,
-        dataset_id: str = "Voxel51/VisDrone2019-DET",
-        split: str = "train",
-        seed: int = 42,
+        temporal_window: int = 4,
+        action_chunk_size: int = 4,
     ) -> None:
         self.processor = processor
+        self.T = temporal_window
+        self.C = action_chunk_size
+        # Each image token sequence adds to effective max length
         image_seq_length = getattr(processor, "image_seq_length", 280)
         try:
             self.image_seq_length = int(image_seq_length)
         except (TypeError, ValueError):
             self.image_seq_length = 280
-        self.max_length = max_length + self.image_seq_length
+        # T images × image_seq_length tokens each
+        self.max_length = max_length + self.T * self.image_seq_length
 
-        # Load records
-        records = []
+        self.records: list[dict] = []
         with open(jsonl_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
-                    records.append(json.loads(line))
-        self.records = records
-
-        # Build sample_id → HF row index mapping by streaming once
-        self._images: dict[str, Any] = {}
-        print(f"  Loading VisDrone images for {len(records)} annotated samples...")
-        try:
-            from datasets import load_dataset
-            hf_ds = load_dataset(dataset_id, split=split, streaming=True)
-            hf_ds = hf_ds.shuffle(buffer_size=5000, seed=seed)
-            needed_ids = {r["sample_id"] for r in records}
-            for idx, row in enumerate(hf_ds):
-                sid = f"visdrone-{idx:06d}"
-                if sid in needed_ids:
-                    img = row.get("image")
-                    if img is not None and hasattr(img, "convert"):
-                        self._images[sid] = img.convert("RGB")
-                if len(self._images) >= len(needed_ids):
-                    break
-            print(f"  Loaded {len(self._images)}/{len(needed_ids)} images.")
-        except Exception as e:
-            print(f"  Warning: could not pre-load images ({e}). Will use blank placeholders.")
+                    self.records.append(json.loads(line))
+        print(f"  TeacherVideoDataset: {len(self.records)} sequences loaded from {jsonl_path}")
 
     def __len__(self) -> int:
         return len(self.records)
@@ -246,40 +235,60 @@ class AnnotatedDroneDataset(Dataset[dict[str, torch.Tensor]]):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         record = self.records[index]
-        sample_id = record["sample_id"]
 
-        image = self._images.get(sample_id)
-        if image is None:
-            image = Image.new("RGB", (640, 480), color=(100, 100, 100))
+        # Load T consecutive frames
+        image_paths = record["image_paths"]
+        if len(image_paths) < self.T:
+            image_paths = [image_paths[0]] * (self.T - len(image_paths)) + image_paths
+        image_paths = image_paths[-self.T:]
 
-        reasoning_trace = record["reasoning_trace"]
-        action_index = int(record["action_index"])
-        halt_step = int(record["halt_step"])
-        answer = f"Action: {action_index}\nHalt: {halt_step}"
+        images = []
+        for p in image_paths:
+            try:
+                images.append(Image.open(p).convert("RGB"))
+            except Exception:
+                images.append(Image.new("RGB", (640, 480), color=(80, 80, 80)))
 
-        # Build prompt: user asks, model reasons + answers
+        reasoning_trace = record.get("reasoning_trace", "")
+        action_indices = record.get("action_indices", [record.get("action_index", 0)] * self.C)
+        halt_steps = record.get("halt_steps", [record.get("halt_step", 3)] * self.C)
+        action_indices = (action_indices * self.C)[: self.C]
+        halt_steps = (halt_steps * self.C)[: self.C]
+
+        # Answer: structured chunk output matching annotate_auair.py format
+        answer_lines = "\n".join(
+            f"Action_{i}: {action_indices[i]}  Halt_{i}: {halt_steps[i]}"
+            for i in range(self.C)
+        )
+
+        user_prompt = _temporal_user_prompt(self.T, self.C)
+
+        # Build prompt with T image tokens
         if self._supports_chat_template():
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image"},
-                        {"type": "text", "text": _ANNOTATION_USER_PROMPT},
-                    ],
-                }
-            ]
+            content: list[dict] = [{"type": "image"} for _ in range(self.T)]
+            content.append({"type": "text", "text": user_prompt})
+            messages = [{"role": "user", "content": content}]
             prompt = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
         else:
-            prompt = f"<image>\n{_ANNOTATION_USER_PROMPT}\n"
+            image_placeholders = "".join(
+                f"<image_{i}>\n" for i in range(self.T)
+            )
+            prompt = f"{image_placeholders}{user_prompt}\n"
 
-        # Target = reasoning trace + answer (model learns to generate the full CoT)
-        full_text = prompt + reasoning_trace.strip() + "\n" + answer + self.processor.tokenizer.eos_token
+        # Full supervised sequence: CoT reasoning + structured answer
+        full_text = (
+            prompt
+            + reasoning_trace.strip()
+            + "\n"
+            + answer_lines
+            + self.processor.tokenizer.eos_token
+        )
 
         inputs = self.processor(
             text=full_text,
-            images=image,
+            images=images,
             return_tensors="pt",
             padding="max_length",
             max_length=self.max_length,
@@ -287,9 +296,10 @@ class AnnotatedDroneDataset(Dataset[dict[str, torch.Tensor]]):
         )
         payload = {k: v.squeeze(0) for k, v in inputs.items()}
 
+        # Mask prompt tokens — supervise only CoT + answer
         prompt_tokens = self.processor(
             text=prompt,
-            images=image,
+            images=images,
             return_tensors="pt",
             truncation=True,
             max_length=self.max_length,
@@ -304,9 +314,19 @@ class AnnotatedDroneDataset(Dataset[dict[str, torch.Tensor]]):
 
 
 def _parse_metrics_from_text(text: str) -> tuple[int | None, int | None]:
+    """Parses current-timestep action and halt from model output.
+
+    Supports both legacy format ('Action: X') and chunk format ('Action_0: X').
+    """
     try:
-        action_match = re.search(r"Action:\s*(\d+)", text)
-        halt_match = re.search(r"Halt:\s*(\d+)", text)
+        # Chunk format (primary): Action_0: X  Halt_0: Y
+        action_match = re.search(r"Action_0:\s*(\d+)", text)
+        halt_match = re.search(r"Halt_0:\s*(\d+)", text)
+        # Legacy fallback
+        if not action_match:
+            action_match = re.search(r"Action:\s*(\d+)", text)
+        if not halt_match:
+            halt_match = re.search(r"Halt:\s*(\d+)", text)
         action = int(action_match.group(1)) if action_match else None
         halt = int(halt_match.group(1)) if halt_match else None
         return action, halt
@@ -372,12 +392,12 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
             param.data = param.data.to(torch.bfloat16)
     model.print_trainable_parameters()
 
-    if config.annotated_data_path is not None:
-        # --- Real-data path: use auto-annotated VisDrone JSONL ---
-        annotated_path = Path(config.annotated_data_path)
-        print(f"\nLoading annotated real drone data from {annotated_path}...")
-        all_records_raw = []
-        with open(annotated_path, encoding="utf-8") as f:
+    if config.auair_path is not None:
+        # --- Real-data path: AU-AIR temporal sequences annotated by Gemma video encoder ---
+        auair_path = Path(config.auair_path)
+        print(f"\nLoading AU-AIR annotated sequences from {auair_path}...")
+        all_records_raw: list[str] = []
+        with open(auair_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
@@ -388,28 +408,28 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
         eval_n = min(config.eval_task_count, max(1, len(all_records_raw) // 10))
         train_n = min(config.task_count, len(all_records_raw) - eval_n)
 
-        train_lines = [all_records_raw[i] for i in indices[:train_n]]
-        eval_lines = [all_records_raw[i] for i in indices[train_n: train_n + eval_n]]
-
-        # Write temp splits
-        import tempfile, os
+        import tempfile
         tmp_dir = Path(tempfile.mkdtemp())
         train_jsonl = tmp_dir / "train.jsonl"
         eval_jsonl = tmp_dir / "eval.jsonl"
-        train_jsonl.write_text("\n".join(train_lines), encoding="utf-8")
-        eval_jsonl.write_text("\n".join(eval_lines), encoding="utf-8")
-
-        dataset_id = "Voxel51/VisDrone2019-DET"
-        split = config.real_dataset_split if config.real_dataset_split else "train"
-
-        print(f"  Train samples: {train_n} | Eval samples: {eval_n}")
-        train_dataset = AnnotatedDroneDataset(
-            train_jsonl, processor, config.max_length,
-            dataset_id=dataset_id, split=split, seed=config.seed,
+        train_jsonl.write_text(
+            "\n".join(all_records_raw[i] for i in indices[:train_n]), encoding="utf-8"
         )
-        eval_dataset = AnnotatedDroneDataset(
+        eval_jsonl.write_text(
+            "\n".join(all_records_raw[i] for i in indices[train_n: train_n + eval_n]),
+            encoding="utf-8",
+        )
+        print(f"  Train sequences: {train_n} | Eval sequences: {eval_n}")
+
+        train_dataset = TeacherVideoDataset(
+            train_jsonl, processor, config.max_length,
+            temporal_window=config.temporal_window,
+            action_chunk_size=config.action_chunk_size,
+        )
+        eval_dataset = TeacherVideoDataset(
             eval_jsonl, processor, config.max_length,
-            dataset_id=dataset_id, split=split, seed=config.seed + 1,
+            temporal_window=config.temporal_window,
+            action_chunk_size=config.action_chunk_size,
         )
     else:
         # --- Synthetic ARC proxy path (legacy) ---
