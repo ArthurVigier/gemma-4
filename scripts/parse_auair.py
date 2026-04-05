@@ -69,7 +69,7 @@ def _velocity_to_halt(linear_x: float, linear_y: float, linear_z: float, dpsi: f
     High speed → lower step (less confident about stopping).
     Near-stationary → high step (almost ready to halt).
     """
-    speed = math.sqrt(linear_x**2 + linear_y**2 + linear_z**2 + dpsi**2)
+    speed = math.sqrt(linear_x**2 + linear_y**2 + linear_z**2)
     # Empirical range from dataset: ~0 to ~0.5 m/s typical
     if speed < 0.02:
         return 6   # hovering, very confident
@@ -85,14 +85,16 @@ def _velocity_to_halt(linear_x: float, linear_y: float, linear_z: float, dpsi: f
         return 1   # fast movement, least confident
 
 
-def _yaw_rate(rec_a: dict, rec_b: dict, dt_s: float) -> float:
-    """Finite difference yaw rate between two consecutive records (rad/s)."""
-    if dt_s < 1e-6:
-        return 0.0
+def _yaw_delta(rec_a: dict, rec_b: dict) -> float:
+    """Raw heading change between two consecutive records (radians, wrapped to [-pi, pi]).
+
+    AU-AIR timestamps have integer-second resolution so dt is often 0 — using a
+    rate (dpsi/dt) would blow up.  Instead we return the raw angular delta and
+    compare it directly against linear velocities; the magnitudes are empirically
+    on the same order (~0.05-0.15 for both).
+    """
     dpsi = rec_b["angle_psi"] - rec_a["angle_psi"]
-    # Wrap to [-pi, pi]
-    dpsi = (dpsi + math.pi) % (2 * math.pi) - math.pi
-    return dpsi / dt_s
+    return (dpsi + math.pi) % (2 * math.pi) - math.pi
 
 
 def _record_time_s(rec: dict) -> float:
@@ -166,10 +168,9 @@ def build_sequences(
             action_indices: list[int] = []
             halt_steps: list[int] = []
             for i, rec in enumerate(chunk):
-                # Yaw rate via finite diff with next frame (or same if last)
+                # Heading delta vs next frame (raw radians, no rate division)
                 if i + 1 < len(chunk):
-                    dt = _record_time_s(chunk[i + 1]) - _record_time_s(rec)
-                    dpsi = _yaw_rate(rec, chunk[i + 1], dt)
+                    dpsi = _yaw_delta(rec, chunk[i + 1])
                 else:
                     dpsi = 0.0
                 a = _velocity_to_action(
