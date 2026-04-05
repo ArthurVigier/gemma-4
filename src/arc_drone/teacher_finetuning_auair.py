@@ -130,6 +130,30 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
             or getattr(getattr(self.processor, "tokenizer", None), "chat_template", None)
         )
 
+    @staticmethod
+    def _make_mosaic(images: list[Image.Image]) -> Image.Image:
+        """Compose T frames into a 2×2 (or 1×T) mosaic as a single image.
+
+        Workaround for transformers 5.5.0 bug: Gemma4's _position_embeddings
+        expects 4D pixel_values but gets 5D when T>1 images are passed separately.
+        Passing a single mosaic image avoids the multi-image code path entirely.
+        """
+        T = len(images)
+        w, h = images[0].size
+        if T == 1:
+            return images[0]
+        if T <= 2:
+            mosaic = Image.new("RGB", (w * T, h))
+            for i, img in enumerate(images):
+                mosaic.paste(img.resize((w, h)), (i * w, 0))
+        else:
+            # 2×2 grid (pad with last frame if T<4)
+            imgs = (images + [images[-1]] * 4)[:4]
+            mosaic = Image.new("RGB", (w * 2, h * 2))
+            for i, img in enumerate(imgs):
+                mosaic.paste(img.resize((w, h)), ((i % 2) * w, (i // 2) * h))
+        return mosaic
+
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         record = self.records[index]
 
@@ -146,10 +170,12 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
             except Exception:
                 images.append(Image.new("RGB", (640, 480), color=(80, 80, 80)))
 
+        # Compose T frames into single mosaic (avoids transformers 5.5.0 5D pixel_values bug)
+        mosaic = self._make_mosaic(images)
+
         # GT labels from telemetry
         action_indices = record.get("action_indices", [record.get("action_index", 0)] * self.C)
         halt_steps = record.get("halt_steps", [record.get("halt_step", 3)] * self.C)
-        # Ensure length C
         action_indices = (list(action_indices) * self.C)[: self.C]
         halt_steps = (list(halt_steps) * self.C)[: self.C]
 
@@ -161,20 +187,20 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
         user_prompt = _user_prompt(self.T, self.C)
 
         if self._supports_chat_template():
-            content: list[dict] = [{"type": "image"} for _ in range(self.T)]
-            content.append({"type": "text", "text": user_prompt})
+            # Single image token for the mosaic
+            content: list[dict] = [{"type": "image"}, {"type": "text", "text": user_prompt}]
             messages = [{"role": "user", "content": content}]
             prompt = self.processor.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
         else:
-            prompt = "".join(f"<image_{i}>\n" for i in range(self.T)) + user_prompt + "\n"
+            prompt = "<image_0>\n" + user_prompt + "\n"
 
         full_text = prompt + answer + self.processor.tokenizer.eos_token
 
         inputs = self.processor(
             text=full_text,
-            images=images,
+            images=mosaic,
             return_tensors="pt",
             padding="max_length",
             max_length=self.max_length,
@@ -185,7 +211,7 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
         # Mask prompt — supervise answer only
         prompt_tokens = self.processor(
             text=prompt,
-            images=images,
+            images=mosaic,
             return_tensors="pt",
             truncation=True,
             max_length=self.max_length,
