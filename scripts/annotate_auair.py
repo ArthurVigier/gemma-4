@@ -143,6 +143,19 @@ def annotate(
                 sequences.append(json.loads(line))
     print(f"Loaded {len(sequences)} sequences from {sequences_path}")
 
+    # Workaround: transformers 5.5.0 bitsandbytes integration calls set_submodule()
+    # which Gemma4ForConditionalGeneration's custom __getattr__ intercepts incorrectly.
+    # Patch nn.Module directly so the method is always found via __dict__ lookup.
+    import torch.nn as _nn
+    if not hasattr(_nn.Module, 'set_submodule'):
+        def _set_submodule(self, target: str, module: _nn.Module) -> None:
+            atoms = target.split('.')
+            mod: _nn.Module = self
+            for item in atoms[:-1]:
+                mod = mod.get_submodule(item)
+            setattr(mod, atoms[-1], module)
+        _nn.Module.set_submodule = _set_submodule
+
     print(f"Loading model {model_id} in 4-bit...")
     bnb = BitsAndBytesConfig(
         load_in_4bit=True,
@@ -154,7 +167,7 @@ def annotate(
         model_id,
         quantization_config=bnb,
         device_map={"": 0},
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation="sdpa",
         trust_remote_code=True,
     )
