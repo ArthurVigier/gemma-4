@@ -2,21 +2,21 @@
 """
 AU-AIR temporal annotation pipeline.
 
-Passes T consecutive frames from AU-AIR sequences to Gemma 4 video encoder,
-generates chain-of-thought reasoning traces that explicitly reason about
-object motion across frames, then predicts an action chunk [a_t..a_t+C-1].
+Two-step generation:
+  1. Free-form chain-of-thought reasoning over T consecutive frames.
+  2. Constrained JSON action chunk via lm-format-enforcer — parse rate 100% by construction.
 
 Output JSONL format (one record per sequence):
   sample_id       : str
   clip_id         : str
   frame_index     : int
   image_paths     : list[str]  (T paths, oldest → newest)
-  reasoning_trace : str        (CoT including temporal motion reasoning)
-  action_indices  : list[int]  (C predicted actions)
-  halt_steps      : list[int]  (C halt steps)
+  reasoning_trace : str        (CoT only, no action lines)
+  action_indices  : list[int]  (C predicted actions, 0-7)
+  halt_steps      : list[int]  (C halt steps, 1-6)
   action_index    : int        (= action_indices[0], convenience)
   halt_step       : int        (= halt_steps[0], convenience)
-  used_heuristic  : bool
+  used_heuristic  : bool       (True if constrained gen failed and telemetry was used)
 
 Usage:
     python scripts/annotate_auair.py \
@@ -31,13 +31,16 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-TEMPORAL_USER_PROMPT = """\
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+TEMPORAL_COT_PROMPT = """\
 You are an autonomous drone navigation assistant analyzing a sequence of {T} consecutive aerial frames.
 
 Study the motion of objects across frames carefully before deciding.
@@ -45,45 +48,44 @@ Study the motion of objects across frames carefully before deciding.
 Step 1 — Describe the scene in the FIRST frame: object types, count, spatial location.
 Step 2 — Track motion: how do objects move from frame 1 to frame {T}? \
 Estimate centroid drift (left/right/up/down) and whether the cluster is accelerating.
-Step 3 — Predict the next {C} drone actions: given the observed motion trajectory, \
-which actions (one per future timestep) should the drone take to follow or intercept the cluster?
+Step 3 — Reason about the next {C} drone actions: given the observed motion trajectory, \
+which actions should the drone take to follow or intercept the cluster?
 Step 4 — Assess confidence for each action (1=very confident, 6=very uncertain).
 
-Output EXACTLY in this format (one line per timestep):
-Action_0: <0-7>  Halt_0: <1-6>
-Action_1: <0-7>  Halt_1: <1-6>
-Action_2: <0-7>  Halt_2: <1-6>
-Action_3: <0-7>  Halt_3: <1-6>
-
-Action index meanings:
-0=north(fwd) 1=south(bwd) 2=east(right) 3=west(left) 4=up 5=down 6=yaw_right 7=yaw_left
+Action index: 0=north(fwd) 1=south(bwd) 2=east(right) 3=west(left) 4=up 5=down 6=yaw_right 7=yaw_left\
 """
 
-def _build_messages(image_paths: list[str], T: int, C: int) -> list[dict]:
-    """Build multimodal message with T image tokens + temporal prompt."""
-    content = []
-    for _ in image_paths:
-        content.append({"type": "image"})
-    content.append({"type": "text", "text": TEMPORAL_USER_PROMPT.format(T=T, C=C)})
+ACTION_JSON_SUFFIX = "Based on your analysis, provide your {C} actions as a compact JSON object:"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Pydantic schema for the action chunk
+# ---------------------------------------------------------------------------
+
+def _make_chunk_model(C: int):
+    """Return a Pydantic model with action_i (0-7) and halt_i (1-6) fields for i in 0..C-1."""
+    try:
+        from pydantic import Field, create_model
+    except ImportError as exc:
+        raise ImportError("pydantic is required: pip install pydantic") from exc
+
+    fields: dict = {}
+    for i in range(C):
+        fields[f"action_{i}"] = (int, Field(ge=0, le=7))
+        fields[f"halt_{i}"] = (int, Field(ge=1, le=6))
+    return create_model("ActionChunk", **fields)
+
+
+def _build_cot_messages(image_paths: list[str], T: int, C: int) -> list[dict]:
+    """Build multimodal message with T image tokens + CoT prompt (no format constraints)."""
+    content = [{"type": "image"} for _ in image_paths]
+    content.append({"type": "text", "text": TEMPORAL_COT_PROMPT.format(T=T, C=C)})
     return [{"role": "user", "content": content}]
 
 
-def _parse_chunk(text: str, C: int) -> tuple[list[int] | None, list[int] | None]:
-    """Parse Action_i / Halt_i lines from model output."""
-    actions, halts = [], []
-    for i in range(C):
-        a_match = re.search(rf"Action_{i}:\s*(\d+)", text)
-        h_match = re.search(rf"Halt_{i}:\s*(\d+)", text)
-        if not a_match or not h_match:
-            return None, None
-        a = int(a_match.group(1))
-        h = int(h_match.group(1))
-        if not (0 <= a <= 7) or not (1 <= h <= 6):
-            return None, None
-        actions.append(a)
-        halts.append(h)
-    return actions, halts
-
+# ---------------------------------------------------------------------------
+# Core annotation function
+# ---------------------------------------------------------------------------
 
 def annotate(
     *,
@@ -99,6 +101,28 @@ def annotate(
     from PIL import Image as PILImage
     from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 
+    try:
+        from lmformatenforcer import JsonSchemaParser
+        from lmformatenforcer.integrations.transformers import (
+            build_transformers_prefix_allowed_tokens_fn,
+        )
+        _lmfe_available = True
+    except ImportError:
+        print(
+            "WARNING: lm-format-enforcer not found. "
+            "Falling back to regex parsing (lower parse rate).\n"
+            "Install with: pip install lm-format-enforcer"
+        )
+        _lmfe_available = False
+
+    T = temporal_window
+    C = action_chunk_size
+
+    # Build pydantic schema and lm-format-enforcer parser once
+    ActionChunk = _make_chunk_model(C)
+    if _lmfe_available:
+        _json_parser = JsonSchemaParser(ActionChunk.model_json_schema())
+
     # Resume: load already-done IDs
     done_ids: set[str] = set()
     if resume and output_path.exists():
@@ -110,7 +134,7 @@ def annotate(
                     pass
         print(f"Resuming: {len(done_ids)} samples already annotated.")
 
-    # Load sequences from parse_auair.py output
+    # Load sequences
     sequences = []
     with open(sequences_path, encoding="utf-8") as f:
         for line in f:
@@ -136,16 +160,23 @@ def annotate(
     )
     model.eval()
 
+    # Build prefix_allowed_tokens_fn from the tokenizer (built once, reused per sample)
+    if _lmfe_available:
+        _prefix_fn = build_transformers_prefix_allowed_tokens_fn(
+            processor.tokenizer, _json_parser
+        )
+    else:
+        _prefix_fn = None
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     out_file = open(output_path, "a", encoding="utf-8")
 
     annotated = len(done_ids)
     skipped = 0
     errors = 0
-    T = temporal_window
-    C = action_chunk_size
 
     print(f"Annotating up to {max_samples} sequences (T={T}, C={C})...")
+    print(f"Constrained decoding: {'enabled (lm-format-enforcer)' if _lmfe_available else 'disabled (regex fallback)'}")
 
     for seq in sequences:
         if annotated >= max_samples:
@@ -160,51 +191,106 @@ def annotate(
             skipped += 1
             continue
 
-        # Load T images
+        image_paths = image_paths[-T:]
+
         try:
-            images = [PILImage.open(p).convert("RGB") for p in image_paths[-T:]]
+            images = [PILImage.open(p).convert("RGB") for p in image_paths]
         except Exception as e:
             print(f"[{sample_id}] image load error: {e}")
             errors += 1
             continue
 
-        messages = _build_messages(image_paths[-T:], T=T, C=C)
-
+        # ── Step 1: free-form CoT generation ─────────────────────────────────
+        cot_messages = _build_cot_messages(image_paths, T=T, C=C)
         try:
-            prompt_text = processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            cot_prompt = processor.apply_chat_template(
+                cot_messages, tokenize=False, add_generation_prompt=True
             )
-            inputs = processor(
-                text=prompt_text,
+            cot_inputs = processor(
+                text=cot_prompt,
                 images=images,
                 return_tensors="pt",
             )
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
-            if "pixel_values" in inputs:
-                inputs["pixel_values"] = inputs["pixel_values"].to(torch.bfloat16)
+            cot_inputs = {k: v.to(model.device) for k, v in cot_inputs.items()}
+            if "pixel_values" in cot_inputs:
+                cot_inputs["pixel_values"] = cot_inputs["pixel_values"].to(torch.bfloat16)
 
             with torch.no_grad():
-                output_ids = model.generate(
-                    **inputs,
-                    max_new_tokens=400,
+                cot_ids = model.generate(
+                    **cot_inputs,
+                    max_new_tokens=350,
                     do_sample=False,
-                    temperature=1.0,
                     pad_token_id=processor.tokenizer.eos_token_id,
                 )
 
-            input_len = inputs["input_ids"].shape[1]
-            generated = output_ids[0][input_len:]
-            response_text = processor.tokenizer.decode(generated, skip_special_tokens=True)
+            cot_input_len = cot_inputs["input_ids"].shape[1]
+            reasoning_trace = processor.tokenizer.decode(
+                cot_ids[0][cot_input_len:], skip_special_tokens=True
+            ).strip()
 
         except Exception as e:
-            print(f"[{sample_id}] generation error: {e}")
+            print(f"[{sample_id}] CoT generation error: {e}")
             errors += 1
             continue
 
-        action_indices, halt_steps = _parse_chunk(response_text, C)
+        # ── Step 2: constrained JSON action chunk ─────────────────────────────
+        action_indices = None
+        halt_steps = None
         used_heuristic = False
 
-        # Fallback to ground-truth telemetry actions from parse_auair output
+        if _lmfe_available:
+            try:
+                # Append CoT output + JSON request to the conversation
+                json_suffix = ACTION_JSON_SUFFIX.format(C=C)
+                json_prompt = cot_prompt + reasoning_trace + "\n" + json_suffix
+                json_inputs = processor(
+                    text=json_prompt,
+                    images=images,
+                    return_tensors="pt",
+                )
+                json_inputs = {k: v.to(model.device) for k, v in json_inputs.items()}
+                if "pixel_values" in json_inputs:
+                    json_inputs["pixel_values"] = json_inputs["pixel_values"].to(torch.bfloat16)
+
+                with torch.no_grad():
+                    json_ids = model.generate(
+                        **json_inputs,
+                        max_new_tokens=120,
+                        do_sample=False,
+                        prefix_allowed_tokens_fn=_prefix_fn,
+                        pad_token_id=processor.tokenizer.eos_token_id,
+                    )
+
+                json_input_len = json_inputs["input_ids"].shape[1]
+                json_text = processor.tokenizer.decode(
+                    json_ids[0][json_input_len:], skip_special_tokens=True
+                ).strip()
+
+                chunk = ActionChunk.model_validate_json(json_text)
+                action_indices = [getattr(chunk, f"action_{i}") for i in range(C)]
+                halt_steps = [getattr(chunk, f"halt_{i}") for i in range(C)]
+
+            except Exception as e:
+                print(f"[{sample_id}] constrained JSON generation error: {e}")
+                # fall through to telemetry fallback below
+
+        else:
+            # Regex fallback (legacy path, lower parse rate)
+            import re
+            actions_found, halts_found = [], []
+            for i in range(C):
+                am = re.search(rf"Action_{i}:\s*(\d+)", reasoning_trace)
+                hm = re.search(rf"Halt_{i}:\s*(\d+)", reasoning_trace)
+                if am and hm:
+                    a, h = int(am.group(1)), int(hm.group(1))
+                    if (0 <= a <= 7) and (1 <= h <= 6):
+                        actions_found.append(a)
+                        halts_found.append(h)
+            if len(actions_found) == C:
+                action_indices = actions_found
+                halt_steps = halts_found
+
+        # ── Telemetry fallback if all else fails ──────────────────────────────
         if action_indices is None:
             gt_actions = seq.get("action_indices")
             gt_halts = seq.get("halt_steps")
@@ -220,8 +306,8 @@ def annotate(
             "sample_id": sample_id,
             "clip_id": seq.get("clip_id", ""),
             "frame_index": seq.get("frame_index", 0),
-            "image_paths": image_paths[-T:],
-            "reasoning_trace": response_text.strip(),
+            "image_paths": image_paths,
+            "reasoning_trace": reasoning_trace,
             "action_indices": action_indices,
             "halt_steps": halt_steps,
             "action_index": action_indices[0],
@@ -244,10 +330,9 @@ def annotate(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Annotate AU-AIR temporal sequences with Gemma 4 video encoder."
+        description="Annotate AU-AIR temporal sequences with Gemma 4 (two-step: CoT + constrained JSON)."
     )
-    parser.add_argument("--sequences", type=str, required=True,
-                        help="JSONL from parse_auair.py")
+    parser.add_argument("--sequences", type=str, required=True, help="JSONL from parse_auair.py")
     parser.add_argument("--output", type=str, default="data/auair_annotated.jsonl")
     parser.add_argument("--model-id", type=str, default="google/gemma-4-e4b-it")
     parser.add_argument("--max-samples", type=int, default=5000)

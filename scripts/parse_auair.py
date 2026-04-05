@@ -114,7 +114,7 @@ def _clip_id(image_name: str) -> str:
 
 
 def load_annotations(annotations_path: Path) -> list[dict]:
-    data = json.loads(annotations_path.read_text(encoding="utf-8"))
+    data = json.loads(annotations_path.read_bytes().decode("utf-8", errors="replace"))
     return data["annotations"]
 
 

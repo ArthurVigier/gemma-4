@@ -475,6 +475,7 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
 
     print(f"\n--- Starting Hybrid Multimodal QLoRA Fine-tuning ---")
     best_eval_loss = float("inf")
+    epoch_history: list[dict] = []
 
     for epoch in range(1, config.epochs + 1):
         model.train()
@@ -545,47 +546,110 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
             })
 
         avg_train_loss = total_train_loss / len(train_loader)
-        
+        train_act_acc = (correct_actions / total_processed * 100) if total_processed > 0 else 0.0
+        train_halt_acc = (correct_halts / total_processed * 100) if total_processed > 0 else 0.0
+
+        # ── Eval loop — all samples per batch, full metric suite ──────────────
         model.eval()
         total_eval_loss = 0.0
         eval_correct_actions = 0
+        eval_correct_halts = 0
+        eval_parseable = 0      # model output contained valid Action_X / Halt_X tokens
         eval_total = 0
-        
+        C = config.action_chunk_size
+        chunk_correct = [0] * C  # per-step accuracy across chunk
+        chunk_parseable = [0] * C
+
         with torch.no_grad():
             for batch in tqdm(eval_loader, desc=f"Epoch {epoch}/{config.epochs} [Eval]"):
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
                 if "pixel_values" in batch:
                     batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
-                
+
                 outputs = model(**batch, return_dict=True)
                 total_eval_loss += outputs.loss.item()
-                
-                logits_e = outputs.logits[0]
-                labels_e = batch["labels"][0]
-                shifted_logits_e = logits_e[:-1]
-                shifted_labels_e = labels_e[1:]
-                vmask_e = shifted_labels_e != -100
-                if vmask_e.any():
+
+                # Iterate over all samples in the batch
+                batch_size = batch["labels"].shape[0]
+                for i in range(batch_size):
+                    logits_e = outputs.logits[i]
+                    labels_e = batch["labels"][i]
+                    shifted_logits_e = logits_e[:-1]
+                    shifted_labels_e = labels_e[1:]
+                    vmask_e = shifted_labels_e != -100
+                    if not vmask_e.any():
+                        continue
+
                     pred_ids = torch.argmax(shifted_logits_e, dim=-1)[vmask_e]
                     true_ids = shifted_labels_e[vmask_e]
                     pred_text = processor.tokenizer.decode(pred_ids, skip_special_tokens=True)
                     true_text = processor.tokenizer.decode(true_ids, skip_special_tokens=True)
-                    pa, _ = _parse_metrics_from_text(pred_text)
-                    ta, _ = _parse_metrics_from_text(true_text)
-                    if pa is not None and pa == ta:
+
+                    pa0, ph0 = _parse_metrics_from_text(pred_text)
+                    ta0, th0 = _parse_metrics_from_text(true_text)
+
+                    if pa0 is not None:
+                        eval_parseable += 1
+                    if pa0 is not None and pa0 == ta0:
                         eval_correct_actions += 1
-                eval_total += 1
-                
-        avg_eval_loss = total_eval_loss / len(eval_loader)
-        eval_acc = (eval_correct_actions / eval_total * 100) if eval_total > 0 else 0
-        
+                    if ph0 is not None and ph0 == th0:
+                        eval_correct_halts += 1
+
+                    # Per-chunk-step accuracy (Action_0..Action_{C-1})
+                    for c in range(C):
+                        pa_c = None
+                        ta_c = None
+                        try:
+                            import re as _re
+                            pm = _re.search(rf"Action_{c}:\s*(\d+)", pred_text)
+                            tm = _re.search(rf"Action_{c}:\s*(\d+)", true_text)
+                            if pm:
+                                pa_c = int(pm.group(1))
+                            if tm:
+                                ta_c = int(tm.group(1))
+                        except Exception:
+                            pass
+                        if pa_c is not None:
+                            chunk_parseable[c] += 1
+                        if pa_c is not None and pa_c == ta_c:
+                            chunk_correct[c] += 1
+
+                    eval_total += 1
+
+        avg_eval_loss = total_eval_loss / max(len(eval_loader), 1)
+        eval_act_acc = (eval_correct_actions / eval_total * 100) if eval_total > 0 else 0.0
+        eval_halt_acc = (eval_correct_halts / eval_total * 100) if eval_total > 0 else 0.0
+        eval_parse_rate = (eval_parseable / eval_total * 100) if eval_total > 0 else 0.0
+        chunk_acc_pct = [
+            (chunk_correct[c] / max(chunk_parseable[c], 1) * 100) for c in range(C)
+        ]
+
         print(f"\n--- Epoch {epoch} Results ---")
-        print(f"Train Loss: {avg_train_loss:.4f} | Eval Loss: {avg_eval_loss:.4f}")
-        print(f"Eval Action Accuracy: {eval_acc:.1f}%")
-        
+        print(f"  Train Loss:       {avg_train_loss:.4f}  |  Eval Loss:       {avg_eval_loss:.4f}")
+        print(f"  Train Act Acc:    {train_act_acc:.1f}%   |  Eval Act Acc:    {eval_act_acc:.1f}%")
+        print(f"  Train Halt Acc:   {train_halt_acc:.1f}%   |  Eval Halt Acc:   {eval_halt_acc:.1f}%")
+        print(f"  Eval Parse Rate:  {eval_parse_rate:.1f}%  ({eval_parseable}/{eval_total} samples parseable)")
+        print(f"  Chunk accuracy per step: " + "  ".join(
+            f"a{c}={chunk_acc_pct[c]:.1f}%" for c in range(C)
+        ))
+
+        epoch_metrics = {
+            "epoch": epoch,
+            "train_loss": avg_train_loss,
+            "eval_loss": avg_eval_loss,
+            "train_action_acc": round(train_act_acc, 2),
+            "train_halt_acc": round(train_halt_acc, 2),
+            "eval_action_acc": round(eval_act_acc, 2),
+            "eval_halt_acc": round(eval_halt_acc, 2),
+            "eval_parse_rate": round(eval_parse_rate, 2),
+            "eval_samples": eval_total,
+            "chunk_acc_per_step": [round(v, 2) for v in chunk_acc_pct],
+        }
+        epoch_history.append(epoch_metrics)
+
         if avg_eval_loss < best_eval_loss:
             best_eval_loss = avg_eval_loss
-            print(f"New best model! Saving hybrid specialist adapter to {output_dir}")
+            print(f"  → New best! Saving adapter to {output_dir}")
             model.save_pretrained(output_dir)
             processor.save_pretrained(output_dir)
 
@@ -595,9 +659,11 @@ def finetune_teacher(config: TeacherFinetuneConfig) -> dict[str, Any]:
         "train_task_count": config.task_count,
         "eval_task_count": config.eval_task_count,
         "epochs": config.epochs,
+        "temporal_window": config.temporal_window,
+        "action_chunk_size": config.action_chunk_size,
         "best_eval_loss": best_eval_loss,
-        "hybrid_multimodal": True
+        "epoch_history": epoch_history,
     }
-    
+
     (output_dir / "finetune_summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
