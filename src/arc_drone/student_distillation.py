@@ -55,6 +55,9 @@ class DistillationCacheConfig:
 @dataclass(frozen=True, slots=True)
 class DistillationConfig:
     foundation_model_id: str = "google/gemma-4-e4b"
+    # Path to LoRA adapters from finetune_gemma_auair.py.
+    # When set, distills from the fine-tuned teacher instead of vanilla Gemma.
+    teacher_lora_path: str | None = None
     teacher_layer_indices: tuple[int, ...] = (17,)
     teacher_feature_pooling: str = "mean"
     cache_dir: str | None = None
@@ -484,6 +487,25 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
 
     cache_dir = config.cache_dir
     if cache_dir is None:
+        # If a fine-tuned LoRA teacher is specified, monkey-patch _load_teacher_components
+        # so the cache is built from the fine-tuned model instead of vanilla Gemma.
+        if config.teacher_lora_path is not None:
+            import arc_drone.gemma_layer_sweep as _gls
+            _orig_load = _gls._load_teacher_components
+
+            def _lora_load_teacher(*, foundation_model_id: str, device: torch.device):
+                tokenizer, model = _orig_load(
+                    foundation_model_id=foundation_model_id, device=device
+                )
+                from peft import PeftModel
+                print(f"  Loading LoRA teacher from {config.teacher_lora_path}...")
+                model = PeftModel.from_pretrained(model, config.teacher_lora_path)
+                model.eval()
+                return tokenizer, model
+
+            _gls._load_teacher_components = _lora_load_teacher
+            print(f"Teacher cache will use fine-tuned LoRA: {config.teacher_lora_path}")
+
         metadata = build_teacher_target_cache(
             DistillationCacheConfig(
                 foundation_model_id=config.foundation_model_id,
@@ -502,6 +524,9 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
             )
         )
         cache_dir = str(metadata["output_dir"])
+        # Restore original loader if it was patched
+        if config.teacher_lora_path is not None:
+            _gls._load_teacher_components = _orig_load
 
     train_cache, eval_cache, cache_metadata = _load_teacher_cache(cache_dir)
     train_dataset = CachedDistillationDataset(train_cache)

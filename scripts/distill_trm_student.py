@@ -22,6 +22,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-layer-indices", type=int, nargs="*", default=None)
     parser.add_argument("--teacher-feature-pooling", choices=("mean", "concat"), default="mean")
     parser.add_argument("--cache-dir")
+    parser.add_argument("--teacher-lora-path", default=None,
+                        help="LoRA adapters from finetune_gemma_auair.py. "
+                             "When set, distills from fine-tuned teacher instead of vanilla.")
     parser.add_argument("--task-count", type=int, default=4096)
     parser.add_argument("--eval-task-count", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -56,6 +59,7 @@ def main() -> int:
     summary = distill_student(
         DistillationConfig(
             foundation_model_id=args.foundation_model_id,
+            teacher_lora_path=args.teacher_lora_path,
             teacher_layer_indices=teacher_layer_indices,
             teacher_feature_pooling=args.teacher_feature_pooling,
             cache_dir=args.cache_dir,
