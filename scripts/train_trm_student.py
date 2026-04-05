@@ -36,6 +36,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--action-regression-weight", type=float, default=0.5)
     parser.add_argument("--halt-loss-weight", type=float, default=0.25)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--temporal-window", type=int, default=4,
+                        help="Number of consecutive frames per input sequence (T).")
+    parser.add_argument("--action-chunk-size", type=int, default=4,
+                        help="Number of future actions predicted per forward pass (C).")
+    parser.add_argument("--auair-path", type=str, default=None,
+                        help="JSONL from parse_auair.py. When set, trains on real AU-AIR "
+                             "sequences instead of synthetic ARC tasks.")
     return parser.parse_args()
 
 
@@ -63,6 +70,9 @@ def main() -> int:
             action_regression_weight=args.action_regression_weight,
             halt_loss_weight=args.halt_loss_weight,
             num_workers=args.num_workers,
+            temporal_window=args.temporal_window,
+            action_chunk_size=args.action_chunk_size,
+            auair_path=args.auair_path,
         )
     )
     print(format_training_summary(summary))

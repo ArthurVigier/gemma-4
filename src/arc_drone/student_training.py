@@ -60,6 +60,9 @@ class StudentTrainingConfig:
     halt_loss_weight: float = 0.5
     temporal_window: int = 4
     action_chunk_size: int = 4
+    # Path to JSONL produced by scripts/parse_auair.py.
+    # When set, trains on real AU-AIR temporal sequences instead of synthetic ARC tasks.
+    auair_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,12 +304,48 @@ def build_dataloaders(
     config: StudentTrainingConfig,
     reasoner_config: ReasonerConfig,
 ) -> tuple[DataLoader[dict[str, torch.Tensor]], DataLoader[dict[str, torch.Tensor]]]:
-    """Builds train/eval loaders from ARC-Drone-Bench tasks."""
+    """Builds train/eval loaders.
 
-    train_bench = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed))
-    eval_bench = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1))
-    train_dataset = ArcStudentDataset(train_bench.generate_tasks(), reasoner_config)
-    eval_dataset = ArcStudentDataset(eval_bench.generate_tasks(), reasoner_config)
+    If config.auair_path is set, uses real AU-AIR temporal sequences with true
+    motion signal. Otherwise falls back to synthetic ARC-Drone-Bench tasks.
+    """
+
+    if config.auair_path is not None:
+        auair_path = Path(config.auair_path)
+        print(f"Loading AU-AIR sequences from {auair_path}...")
+        records_raw: list[str] = []
+        with open(auair_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records_raw.append(line)
+
+        rng = np.random.default_rng(config.seed)
+        indices = rng.permutation(len(records_raw))
+        eval_n = min(config.eval_task_count, max(1, len(records_raw) // 10))
+        train_n = min(config.task_count, len(records_raw) - eval_n)
+
+        import tempfile
+        tmp_dir = Path(tempfile.mkdtemp())
+        train_jsonl = tmp_dir / "train.jsonl"
+        eval_jsonl = tmp_dir / "eval.jsonl"
+        train_jsonl.write_text(
+            "\n".join(records_raw[i] for i in indices[:train_n]), encoding="utf-8"
+        )
+        eval_jsonl.write_text(
+            "\n".join(records_raw[i] for i in indices[train_n: train_n + eval_n]),
+            encoding="utf-8",
+        )
+        print(f"  Train: {train_n} sequences | Eval: {eval_n} sequences")
+
+        train_dataset: Dataset = AuAirStudentDataset(train_jsonl, reasoner_config)
+        eval_dataset: Dataset = AuAirStudentDataset(eval_jsonl, reasoner_config)
+    else:
+        train_bench = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed))
+        eval_bench = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1))
+        train_dataset = ArcStudentDataset(train_bench.generate_tasks(), reasoner_config)
+        eval_dataset = ArcStudentDataset(eval_bench.generate_tasks(), reasoner_config)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
