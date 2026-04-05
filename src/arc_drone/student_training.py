@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 import numpy as np
 import torch
@@ -312,7 +316,8 @@ def build_dataloaders(
 
     if config.auair_path is not None:
         auair_path = Path(config.auair_path)
-        print(f"Loading AU-AIR sequences from {auair_path}...")
+        logger.info("Loading AU-AIR sequences from %s...", auair_path)
+        t0 = time.perf_counter()
         records_raw: list[str] = []
         with open(auair_path, encoding="utf-8") as f:
             for line in f:
@@ -336,7 +341,10 @@ def build_dataloaders(
             "\n".join(records_raw[i] for i in indices[train_n: train_n + eval_n]),
             encoding="utf-8",
         )
-        print(f"  Train: {train_n} sequences | Eval: {eval_n} sequences")
+        logger.info(
+            "AU-AIR dataset loaded in %.2fs — train: %d sequences  eval: %d sequences",
+            time.perf_counter() - t0, train_n, eval_n,
+        )
 
         train_dataset: Dataset = AuAirStudentDataset(train_jsonl, reasoner_config)
         eval_dataset: Dataset = AuAirStudentDataset(eval_jsonl, reasoner_config)
@@ -474,9 +482,9 @@ def train_student(config: StudentTrainingConfig) -> StudentTrainingSummary:
     if device.type == "cuda":
         try:
             model = torch.compile(model)
-            print("torch.compile: enabled (reduces kernel launch overhead ~20-30%)")
+            logger.info("torch.compile: enabled (reduces kernel launch overhead ~20-30%%)")
         except Exception as e:
-            print(f"torch.compile: skipped ({e})")
+            logger.warning("torch.compile: skipped — %s", e)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
@@ -485,12 +493,24 @@ def train_student(config: StudentTrainingConfig) -> StudentTrainingSummary:
     train_loader, eval_loader = build_dataloaders(config, reasoner_config)
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
 
+    n_params = parameter_count_millions(model)
+    logger.info(
+        "Student model ready | params=%.3fM  device=%s  hidden=%d  steps=%d  threshold=%.2f",
+        n_params, device, config.hidden_size, config.refinement_steps, config.halting_threshold,
+    )
+    logger.info(
+        "Training for %d epochs | batch=%d  lr=%.2e  wd=%.4f",
+        config.epochs, config.batch_size, config.learning_rate, config.weight_decay,
+    )
+
     history: list[EpochMetrics] = []
     best_eval_action_accuracy = -1.0
     best_eval_halt_step_mae = float("inf")
     best_checkpoint_path = output_dir / "best_student.pt"
 
     for epoch in range(1, config.epochs + 1):
+        logger.info("Epoch %d/%d starting...", epoch, config.epochs)
+        t_epoch = time.perf_counter()
         train_metrics = _run_epoch(
             model=model,
             loader=train_loader,
@@ -519,6 +539,14 @@ def train_student(config: StudentTrainingConfig) -> StudentTrainingSummary:
             eval_halt_step_mae=eval_metrics["halt_step_mae"],
         )
         history.append(epoch_metrics)
+        logger.info(
+            "Epoch %d/%d done in %.1fs | "
+            "train_loss=%.4f  train_acc=%.1f%%  train_halt_mae=%.4f | "
+            "eval_loss=%.4f  eval_acc=%.1f%%  eval_halt_mae=%.4f",
+            epoch, config.epochs, time.perf_counter() - t_epoch,
+            train_metrics["loss"], train_metrics["action_accuracy"] * 100, train_metrics["halt_step_mae"],
+            eval_metrics["loss"], eval_metrics["action_accuracy"] * 100, eval_metrics["halt_step_mae"],
+        )
 
         checkpoint_payload = {
             "epoch": epoch,
@@ -536,6 +564,8 @@ def train_student(config: StudentTrainingConfig) -> StudentTrainingSummary:
             best_eval_action_accuracy = eval_metrics["action_accuracy"]
             best_eval_halt_step_mae = eval_metrics["halt_step_mae"]
             torch.save(checkpoint_payload, best_checkpoint_path)
+            logger.info("New best checkpoint — eval_acc=%.1f%%  halt_mae=%.4f  saved to %s",
+                        best_eval_action_accuracy * 100, best_eval_halt_step_mae, best_checkpoint_path)
 
     onnx_output_path: str | None = None
     trtexec_command: list[str] | None = None
@@ -603,11 +633,13 @@ def _run_epoch(
 ) -> dict[str, float]:
     """Runs one train or eval epoch."""
 
+    mode_str = "train" if training else "eval"
     model.train(mode=training)
     total_loss = 0.0
     total_action_accuracy = 0.0
     total_halt_step_mae = 0.0
     batch_count = 0
+    log_every = config.log_every_steps
 
     for batch in loader:
         batch_count += 1
@@ -625,6 +657,15 @@ def _run_epoch(
         total_loss += float(loss.item())
         total_action_accuracy += metrics["action_accuracy"]
         total_halt_step_mae += metrics["halt_step_mae"]
+
+        if batch_count % log_every == 0:
+            logger.debug(
+                "[%s] batch=%d  loss=%.4f  acc=%.1f%%  halt_mae=%.4f",
+                mode_str, batch_count,
+                total_loss / batch_count,
+                total_action_accuracy / batch_count * 100,
+                total_halt_step_mae / batch_count,
+            )
 
     if batch_count == 0:
         raise ValueError("Empty dataloader encountered during training.")

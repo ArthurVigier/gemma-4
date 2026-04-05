@@ -15,7 +15,10 @@ The model learns: [T frames] → action chunk (GT) with optional CoT prefix.
 from __future__ import annotations
 
 import json
+import logging
+import platform
 import re
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -34,10 +37,12 @@ except Exception:
 from .gemma_layer_sweep import _lazy_import_transformers
 from .student_training import select_device, set_seed
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Prompt
 # ---------------------------------------------------------------------------
+# ... rest of code ...
 
 def _user_prompt(T: int, C: int) -> str:
     return (
@@ -114,7 +119,7 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
                 line = line.strip()
                 if line:
                     self.records.append(json.loads(line))
-        print(f"  AuAirTeacherDataset: {len(self.records)} sequences from {jsonl_path}")
+        logger.info("AuAirTeacherDataset loaded %d sequences from %s", len(self.records), jsonl_path)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -224,10 +229,11 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
     from peft import LoraConfig, get_peft_model
     from transformers import BitsAndBytesConfig, get_cosine_schedule_with_warmup
 
-    print("--- AU-AIR Teacher Fine-tuning (GT telemetry labels) ---")
-    print(f"Model:  {config.foundation_model_id}")
-    print(f"Data:   {config.auair_path}")
-    print(f"Device: {device} ({torch.cuda.get_device_name(0)})")
+    logger.info("--- AU-AIR Teacher Fine-tuning (GT telemetry labels) ---")
+    logger.info("Model:  %s", config.foundation_model_id)
+    logger.info("Data:   %s", config.auair_path)
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    logger.info("Device: %s (%s)", device, gpu_name)
 
     # ── Load all records and split ──────────────────────────────────────────
     all_lines: list[str] = []
@@ -241,7 +247,7 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
     idx = rng.permutation(len(all_lines))
     eval_n = min(config.eval_task_count, max(1, int(len(all_lines) * config.eval_ratio)))
     train_n = min(config.task_count, len(all_lines) - eval_n)
-    print(f"Train: {train_n}  |  Eval: {eval_n}  (total available: {len(all_lines)})")
+    logger.info("Dataset split — train: %d  eval: %d  (total available: %d)", train_n, eval_n, len(all_lines))
 
     import tempfile
     tmp = Path(tempfile.mkdtemp())
@@ -249,7 +255,8 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
     (tmp / "eval.jsonl").write_text("\n".join(all_lines[i] for i in idx[train_n: train_n + eval_n]))
 
     # ── Model ───────────────────────────────────────────────────────────────
-    print("\nLoading processor...")
+    logger.info("Loading processor for %s...", config.foundation_model_id)
+    t_load = time.time()
     processor = AutoProcessor.from_pretrained(config.foundation_model_id, trust_remote_code=True)
 
     # Workaround: transformers 5.5.0 bitsandbytes set_submodule bug with Gemma4
@@ -263,7 +270,7 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
             setattr(mod, atoms[-1], module)
         _nn.Module.set_submodule = _set_submodule
 
-    print("Loading model in 4-bit QLoRA...")
+    logger.info("Loading model in 4-bit QLoRA...")
     bnb = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -296,6 +303,7 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
         if "lora" in name:
             param.data = param.data.to(torch.bfloat16)
     model.print_trainable_parameters()
+    logger.info("Model loaded in %.1fs", time.time() - t_load)
 
     # ── Datasets ────────────────────────────────────────────────────────────
     train_ds = AuAirTeacherDataset(
@@ -315,10 +323,10 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
     try:
         import bitsandbytes as bnb_opt
         optimizer = bnb_opt.optim.AdamW8bit(model.parameters(), lr=config.learning_rate)
-        print("Optimizer: AdamW 8-bit")
+        logger.info("Optimizer: AdamW 8-bit  lr=%.2e", config.learning_rate)
     except ImportError:
         optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-        print("Optimizer: AdamW")
+        logger.warning("bitsandbytes not available — falling back to standard AdamW  lr=%.2e", config.learning_rate)
 
     total_steps = (len(train_loader) // config.gradient_accumulation_steps) * config.epochs
     warmup_steps = max(1, int(total_steps * 0.05))
@@ -327,12 +335,14 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
     )
 
     # ── Training ────────────────────────────────────────────────────────────
-    print(f"\n--- Training ({config.epochs} epochs) ---")
+    logger.info("Starting training — %d epochs, %d steps/epoch, warmup=%d", config.epochs, len(train_loader) // config.gradient_accumulation_steps, warmup_steps)
     best_eval_loss = float("inf")
     epoch_history: list[dict] = []
     C = config.action_chunk_size
 
     for epoch in range(1, config.epochs + 1):
+        logger.info("Epoch %d/%d starting...", epoch, config.epochs)
+        t_epoch = time.time()
         model.train()
         total_train_loss = 0.0
         correct_actions = 0
@@ -375,9 +385,14 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
                     total_processed += 1
 
                     if batch_idx % config.log_sample_every == 0:
-                        tqdm.write(f"\n[B{batch_idx}] loss={loss.item()*config.gradient_accumulation_steps:.4f} lr={scheduler.get_last_lr()[0]:.2e}")
-                        tqdm.write(f"  GT:   {true_text.strip()[:120]}")
-                        tqdm.write(f"  Pred: {pred_text.strip()[:120]}")
+                        logger.debug(
+                            "[B%d] loss=%.4f  lr=%.2e",
+                            batch_idx,
+                            loss.item() * config.gradient_accumulation_steps,
+                            scheduler.get_last_lr()[0],
+                        )
+                        logger.debug("  GT:   %s", true_text.strip()[:120])
+                        logger.debug("  Pred: %s", pred_text.strip()[:120])
 
             pbar.set_postfix({"loss": f"{loss.item()*config.gradient_accumulation_steps:.4f}",
                               "act0_acc": f"{correct_actions/max(total_processed,1)*100:.1f}%"})
@@ -422,11 +437,16 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
         eval_parse_rate = eval_parseable / max(eval_total, 1) * 100
         chunk_acc = [eval_correct[c] / max(eval_parseable, 1) * 100 for c in range(C)]
 
-        print(f"\n--- Epoch {epoch} ---")
-        print(f"  Train loss: {avg_train_loss:.4f}  |  Eval loss: {avg_eval_loss:.4f}")
-        print(f"  Train act0 acc: {train_act_acc:.1f}%")
-        print(f"  Eval parse rate: {eval_parse_rate:.1f}%  ({eval_parseable}/{eval_total})")
-        print(f"  Eval chunk acc: " + "  ".join(f"a{c}={chunk_acc[c]:.1f}%" for c in range(C)))
+        t_epoch_elapsed = time.time() - t_epoch
+        chunk_acc_str = "  ".join(f"a{c}={chunk_acc[c]:.1f}%" for c in range(C))
+        logger.info(
+            "Epoch %d/%d done in %.1fs | train_loss=%.4f  eval_loss=%.4f  "
+            "train_act0=%.1f%%  eval_parse=%.1f%%  eval_chunk=[%s]",
+            epoch, config.epochs, t_epoch_elapsed,
+            avg_train_loss, avg_eval_loss,
+            train_act_acc, eval_parse_rate,
+            chunk_acc_str,
+        )
 
         epoch_metrics = {
             "epoch": epoch,
@@ -441,7 +461,7 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
 
         if avg_eval_loss < best_eval_loss:
             best_eval_loss = avg_eval_loss
-            print(f"  → New best! Saving to {output_dir}")
+            logger.info("New best eval loss %.4f — saving adapters to %s", best_eval_loss, output_dir)
             model.save_pretrained(output_dir)
             processor.save_pretrained(output_dir)
 

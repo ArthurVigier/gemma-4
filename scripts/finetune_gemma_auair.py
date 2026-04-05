@@ -12,10 +12,18 @@ Usage:
         --learning-rate 2e-4
 """
 import argparse
+import logging
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 from arc_drone.teacher_finetuning_auair import AuAirTeacherConfig, finetune_auair_teacher
 
@@ -59,8 +67,12 @@ def main() -> None:
         max_length=args.max_length,
     )
 
-    print(f"Starting AU-AIR teacher fine-tuning...")
+    logger.info(
+        "Starting AU-AIR teacher fine-tuning | model=%s  data=%s  epochs=%d  lr=%.2e",
+        args.foundation_model_id, args.auair_path, args.epochs, args.learning_rate,
+    )
     summary = finetune_auair_teacher(config)
+    logger.info("Fine-tuning complete — best eval loss: %.4f", summary["best_eval_loss"])
     print(f"\nDone. Best eval loss: {summary['best_eval_loss']:.4f}")
     print(f"Adapters saved to: {summary['output_dir']}")
 

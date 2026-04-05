@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 import torch
 from torch import nn
@@ -257,7 +261,8 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
     train_base = ArcStudentDataset(train_tasks, reasoner_config)
     eval_base = ArcStudentDataset(eval_tasks, reasoner_config)
 
-    print("Building teacher features for train split...")
+    logger.info("Building teacher features for train split (%d tasks)...", len(train_tasks))
+    t0 = time.perf_counter()
     train_features_by_layer, _, _, hidden_layer_count = build_teacher_features(
         tasks=train_tasks,
         foundation_model_id=config.foundation_model_id,
@@ -265,7 +270,9 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
         max_length=config.teacher_max_length,
         device=device,
     )
-    print("Building teacher features for eval split...")
+    logger.info("Train teacher features built in %.1fs", time.perf_counter() - t0)
+    logger.info("Building teacher features for eval split (%d tasks)...", len(eval_tasks))
+    t0 = time.perf_counter()
     eval_features_by_layer, _, _, _ = build_teacher_features(
         tasks=eval_tasks,
         foundation_model_id=config.foundation_model_id,
@@ -273,6 +280,7 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
         max_length=config.teacher_max_length,
         device=device,
     )
+    logger.info("Eval teacher features built in %.1fs", time.perf_counter() - t0)
 
     combined_train_features = _combine_teacher_features(
         features_by_layer=train_features_by_layer,
@@ -287,7 +295,8 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
 
     train_action_indices = torch.stack([train_base[index]["action_index"] for index in range(len(train_base))])
     train_halt_steps = torch.stack([train_base[index]["halt_step"] for index in range(len(train_base))])
-    print("Fitting teacher probe...")
+    logger.info("Fitting teacher probe (layers=%s, pooling=%s)...", list(layer_indices), config.teacher_feature_pooling)
+    t0 = time.perf_counter()
     teacher_probe = _fit_teacher_probe(
         teacher_features=combined_train_features,
         action_indices=train_action_indices,
@@ -298,13 +307,14 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
         probe_learning_rate=config.teacher_probe_learning_rate,
         refinement_steps=config.refinement_steps,
     )
-    print("Projecting teacher logits for train split...")
+    logger.info("Teacher probe fitted in %.1fs", time.perf_counter() - t0)
+    logger.info("Projecting teacher logits for train split...")
     train_teacher_action_logits, train_teacher_halt_logits = _project_teacher_logits(
         probe=teacher_probe,
         teacher_features=combined_train_features,
         device=device,
     )
-    print("Projecting teacher logits for eval split...")
+    logger.info("Projecting teacher logits for eval split...")
     eval_teacher_action_logits, eval_teacher_halt_logits = _project_teacher_logits(
         probe=teacher_probe,
         teacher_features=combined_eval_features,
@@ -498,13 +508,13 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
                     foundation_model_id=foundation_model_id, device=device
                 )
                 from peft import PeftModel
-                print(f"  Loading LoRA teacher from {config.teacher_lora_path}...")
+                logger.info("Loading LoRA teacher from %s...", config.teacher_lora_path)
                 model = PeftModel.from_pretrained(model, config.teacher_lora_path)
                 model.eval()
                 return tokenizer, model
 
             _gls._load_teacher_components = _lora_load_teacher
-            print(f"Teacher cache will use fine-tuned LoRA: {config.teacher_lora_path}")
+            logger.info("Teacher cache will use fine-tuned LoRA: %s", config.teacher_lora_path)
 
         metadata = build_teacher_target_cache(
             DistillationCacheConfig(
@@ -537,11 +547,17 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
     teacher_hidden_size = int(cache_metadata["teacher_feature_dim"])
     model = DistilledReasoner(reasoner_config=reasoner_config, teacher_hidden_size=teacher_hidden_size)
     model = model.to(device)
-    
-    print(f"Distillation starting on device: {device}")
+
+    logger.info(
+        "Distillation starting | device=%s  train=%d  eval=%d  teacher_hidden=%d",
+        device, len(train_dataset), len(eval_dataset), teacher_hidden_size,
+    )
     if device.type == "cuda":
-        print(f"GPU Model: {torch.cuda.get_device_name(0)}")
-        print(f"Memory Allocated: {torch.cuda.memory_allocated(0) / 1024**2:.2f} MB")
+        logger.info(
+            "GPU: %s  |  memory allocated: %.1f MB",
+            torch.cuda.get_device_name(0),
+            torch.cuda.memory_allocated(0) / 1024 ** 2,
+        )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
@@ -551,7 +567,15 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
     best_eval_halt_step_mae = float("inf")
     best_checkpoint_path = output_dir / "best_student.pt"
 
+    logger.info(
+        "Training for %d epochs | batch=%d  lr=%.2e  kl_weight=%.2f  action_weight=%.2f",
+        config.epochs, config.batch_size, config.learning_rate,
+        config.teacher_kl_weight, config.action_loss_weight,
+    )
+
     for epoch in tqdm(range(1, config.epochs + 1), desc="distill epochs"):
+        logger.info("Distillation epoch %d/%d starting...", epoch, config.epochs)
+        t_epoch = time.perf_counter()
         train_metrics = _run_epoch(
             model=model,
             loader=train_loader,
@@ -580,6 +604,14 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
             "eval_halt_step_mae": eval_metrics["halt_step_mae"],
         }
         history.append(epoch_metrics)
+        logger.info(
+            "Distillation epoch %d/%d done in %.1fs | "
+            "train_loss=%.4f  train_acc=%.1f%%  train_halt_mae=%.4f | "
+            "eval_loss=%.4f  eval_acc=%.1f%%  eval_halt_mae=%.4f",
+            epoch, config.epochs, time.perf_counter() - t_epoch,
+            train_metrics["loss"], train_metrics["action_accuracy"] * 100, train_metrics["halt_step_mae"],
+            eval_metrics["loss"], eval_metrics["action_accuracy"] * 100, eval_metrics["halt_step_mae"],
+        )
 
         checkpoint_payload = {
             "epoch": epoch,
@@ -598,6 +630,8 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
             best_eval_action_accuracy = eval_metrics["action_accuracy"]
             best_eval_halt_step_mae = eval_metrics["halt_step_mae"]
             torch.save(checkpoint_payload, best_checkpoint_path)
+            logger.info("New best checkpoint — eval_acc=%.1f%%  halt_mae=%.4f  saved to %s",
+                        best_eval_action_accuracy * 100, best_eval_halt_step_mae, best_checkpoint_path)
 
     onnx_output_path = None
     trtexec_command = None

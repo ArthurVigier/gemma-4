@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 import sys
 
@@ -10,6 +11,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SRC_PATH = REPO_ROOT / "src"
 if SRC_PATH.as_posix() not in sys.path:
     sys.path.insert(0, SRC_PATH.as_posix())
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 from arc_drone.student_distillation import DistillationConfig, distill_student
 from arc_drone.student_training import format_training_summary
@@ -56,6 +64,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     teacher_layer_indices = tuple(args.teacher_layer_indices) if args.teacher_layer_indices else (args.teacher_layer_index,)
+    logger.info(
+        "Starting student distillation | model=%s  device=%s  epochs=%d  lr=%.2e  "
+        "teacher_layers=%s  kl_weight=%.2f  lora_teacher=%s",
+        args.foundation_model_id, args.device, args.epochs, args.learning_rate,
+        list(teacher_layer_indices), args.teacher_kl_weight,
+        args.teacher_lora_path or "none",
+    )
     summary = distill_student(
         DistillationConfig(
             foundation_model_id=args.foundation_model_id,
@@ -89,6 +104,10 @@ def main() -> int:
             teacher_temperature=args.teacher_temperature,
             teacher_max_length=args.teacher_max_length,
         )
+    )
+    logger.info(
+        "Distillation complete | best_eval_action_accuracy=%.4f  best_eval_halt_mae=%.4f  output=%s",
+        summary.best_eval_action_accuracy, summary.best_eval_halt_step_mae, summary.output_dir,
     )
     print(format_training_summary(summary))
     return 0

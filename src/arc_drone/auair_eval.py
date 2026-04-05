@@ -15,6 +15,7 @@ Also supports test-time LoRA adaptation (NVARC-inspired OOD resilience):
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -24,6 +25,8 @@ from typing import Any
 import numpy as np
 import torch
 from PIL import Image
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +84,9 @@ def _load_sequences(jsonl_path: Path, max_samples: int, seed: int = 42) -> list[
                 records.append(json.loads(line))
     rng = np.random.default_rng(seed)
     idx = rng.permutation(len(records))[:max_samples]
-    return [records[i] for i in idx]
+    selected = [records[i] for i in idx]
+    logger.info("Loaded %d sequences from %s (total in file: %d)", len(selected), jsonl_path, len(records))
+    return selected
 
 
 def _load_images(image_paths: list[str], T: int) -> list[Image.Image]:
@@ -131,7 +136,8 @@ def evaluate_gemma(
     name = model_name or ("gemma4_lora" if lora_path else "gemma4_vanilla")
     T, C = temporal_window, action_chunk_size
 
-    print(f"\n[{name}] Loading model...")
+    logger.info("[%s] Loading model %s (lora=%s)...", name, model_id, lora_path or "none")
+    t_load = time.perf_counter()
 
     # Workaround: transformers 5.5.0 bitsandbytes set_submodule bug
     import torch.nn as _nn
@@ -157,10 +163,11 @@ def evaluate_gemma(
 
     if lora_path is not None:
         from peft import PeftModel
-        print(f"[{name}] Loading LoRA adapters from {lora_path}...")
+        logger.info("[%s] Loading LoRA adapters from %s...", name, lora_path)
         model = PeftModel.from_pretrained(model, lora_path)
 
     model.eval()
+    logger.info("[%s] Model ready in %.1fs | evaluating %d sequences", name, time.perf_counter() - t_load, len(sequences))
 
     correct_actions = [0] * C
     correct_halts = 0
@@ -210,12 +217,19 @@ def evaluate_gemma(
                     correct_halts += 1
 
         except Exception as e:
-            print(f"  [{seq.get('sample_id')}] error: {e}")
+            logger.error("[%s] sample %s failed: %s", name, seq.get("sample_id"), e)
 
         total += 1
+        if total % 50 == 0:
+            logger.debug(
+                "[%s] progress %d/%d | parse=%.1f%%  acc=%.1f%%",
+                name, total, len(sequences),
+                parseable / total * 100,
+                correct_actions[0] / total * 100,
+            )
 
     n_heuristic = sum(1 for s in sequences if s.get("used_heuristic", False))
-    return ModelResult(
+    result = ModelResult(
         model_name=name,
         action_acc=correct_actions[0] / max(total, 1) * 100,
         chunk_acc=[correct_actions[c] / max(total, 1) * 100 for c in range(C)],
@@ -225,6 +239,11 @@ def evaluate_gemma(
         n_samples=total,
         n_heuristic=n_heuristic,
     )
+    logger.info(
+        "[%s] eval done | action0=%.1f%%  parse=%.1f%%  halt=%.1f%%  latency=%.0fms  n=%d",
+        name, result.action_acc, result.parse_rate, result.halt_acc, result.ms_per_sample, total,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +268,8 @@ def evaluate_trm(
     T, C = temporal_window, action_chunk_size
     dev = torch.device(device if torch.cuda.is_available() else "cpu")
 
-    print(f"\n[{name}] Loading checkpoint from {checkpoint_path}...")
+    logger.info("[%s] Loading checkpoint from %s...", name, checkpoint_path)
+    t_load = time.perf_counter()
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     reasoner_cfg = ckpt.get("reasoner_config", {})
     rc = ReasonerConfig(
@@ -263,6 +283,8 @@ def evaluate_trm(
     state = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state, strict=False)
     model.eval()
+    logger.info("[%s] Checkpoint loaded in %.1fs | device=%s  evaluating %d sequences",
+                name, time.perf_counter() - t_load, dev, len(sequences))
 
     correct_actions = [0] * C
     correct_halts = 0
@@ -299,9 +321,15 @@ def evaluate_trm(
             correct_halts += 1
 
         total += 1
+        if total % 50 == 0:
+            logger.debug(
+                "[%s] progress %d/%d | acc=%.1f%%",
+                name, total, len(sequences),
+                correct_actions[0] / total * 100,
+            )
 
     n_heuristic = sum(1 for s in sequences if s.get("used_heuristic", False))
-    return ModelResult(
+    result = ModelResult(
         model_name=name,
         action_acc=correct_actions[0] / max(total, 1) * 100,
         chunk_acc=[correct_actions[c] / max(total, 1) * 100 for c in range(C)],
@@ -311,6 +339,11 @@ def evaluate_trm(
         n_samples=total,
         n_heuristic=n_heuristic,
     )
+    logger.info(
+        "[%s] eval done | action0=%.1f%%  halt=%.1f%%  latency=%.0fms  n=%d",
+        name, result.action_acc, result.halt_acc, result.ms_per_sample, total,
+    )
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -341,7 +374,9 @@ def adapt_and_evaluate_gemma(
     T, C = temporal_window, action_chunk_size
     name = f"gemma4_lora_tta_{len(adapt_sequences)}shot"
 
-    print(f"\n[{name}] Adapting on {len(adapt_sequences)} examples ({adapt_steps} steps)...")
+    logger.info("[%s] Loading model for TTA | adapt_shots=%d  adapt_steps=%d  lora=%s",
+                name, len(adapt_sequences), adapt_steps, base_lora_path)
+    t_load = time.perf_counter()
 
     import torch.nn as _nn
     if not hasattr(_nn.Module, "set_submodule"):
@@ -388,6 +423,7 @@ def adapt_and_evaluate_gemma(
     from torch.utils.data import DataLoader
     adapt_loader = DataLoader(adapt_ds, batch_size=min(4, len(adapt_sequences)), shuffle=True)
 
+    logger.info("[%s] Model loaded in %.1fs — starting adaptation...", name, time.perf_counter() - t_load)
     model.train()
     step = 0
     for batch in adapt_loader:
@@ -403,7 +439,7 @@ def adapt_and_evaluate_gemma(
         step += 1
 
     model.eval()
-    print(f"[{name}] Adaptation done ({step} steps). Evaluating...")
+    logger.info("[%s] Adaptation done (%d steps) — evaluating %d sequences...", name, step, len(eval_sequences))
 
     # Now evaluate using the adapted model
     correct_actions = [0] * C
@@ -448,12 +484,19 @@ def adapt_and_evaluate_gemma(
                 if ph is not None and ph[0] == gt_halts[0]:
                     correct_halts += 1
         except Exception as e:
-            print(f"  [{seq.get('sample_id')}] error: {e}")
+            logger.error("[%s] sample %s failed: %s", name, seq.get("sample_id"), e)
 
         total += 1
+        if total % 50 == 0:
+            logger.debug(
+                "[%s] progress %d/%d | parse=%.1f%%  acc=%.1f%%",
+                name, total, len(eval_sequences),
+                parseable / total * 100,
+                correct_actions[0] / total * 100,
+            )
 
     n_heuristic = sum(1 for s in eval_sequences if s.get("used_heuristic", False))
-    return ModelResult(
+    result = ModelResult(
         model_name=name,
         action_acc=correct_actions[0] / max(total, 1) * 100,
         chunk_acc=[correct_actions[c] / max(total, 1) * 100 for c in range(C)],
@@ -464,3 +507,8 @@ def adapt_and_evaluate_gemma(
         n_heuristic=n_heuristic,
         extra={"adapt_steps": step, "adapt_shots": len(adapt_sequences)},
     )
+    logger.info(
+        "[%s] TTA eval done | action0=%.1f%%  parse=%.1f%%  halt=%.1f%%  latency=%.0fms  n=%d",
+        name, result.action_acc, result.parse_rate, result.halt_acc, result.ms_per_sample, total,
+    )
+    return result

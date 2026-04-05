@@ -31,10 +31,19 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 from arc_drone.auair_eval import (
     ModelResult,
@@ -110,20 +119,30 @@ def main() -> None:
     T, C = args.temporal_window, args.action_chunk_size
     sequences_path = Path(args.sequences)
 
+    logger.info(
+        "Benchmark config | model=%s  sequences=%s  n_eval=%d  seed=%d  T=%d  C=%d",
+        args.model_id, sequences_path, args.n_eval, args.seed, T, C,
+    )
+
     # Load and split: adapt pool (for TTA) + eval pool
     n_adapt = args.n_adapt or args.tta_shots
     total_needed = args.n_eval + n_adapt
+    t0 = time.perf_counter()
     all_seqs = _load_sequences(sequences_path, max_samples=total_needed, seed=args.seed)
     adapt_seqs = all_seqs[:n_adapt]
     eval_seqs = all_seqs[n_adapt: n_adapt + args.n_eval]
-    print(f"Loaded {len(eval_seqs)} eval sequences, {len(adapt_seqs)} adapt sequences")
-    print(f"GT heuristic rate in eval: {sum(s.get('used_heuristic', False) for s in eval_seqs)/max(len(eval_seqs),1)*100:.1f}%")
+    heuristic_rate = sum(s.get("used_heuristic", False) for s in eval_seqs) / max(len(eval_seqs), 1) * 100
+    logger.info(
+        "Sequences loaded in %.2fs — eval=%d  adapt=%d  heuristic_rate=%.1f%%",
+        time.perf_counter() - t0, len(eval_seqs), len(adapt_seqs), heuristic_rate,
+    )
 
     results: list[ModelResult] = []
 
     # ── 1. Vanilla baseline ──────────────────────────────────────────────────
     if not args.skip_vanilla:
-        print("\n[1/4] Vanilla Gemma 4 (zero-shot baseline)")
+        logger.info("[1/4] Starting vanilla Gemma 4 zero-shot evaluation")
+        t_step = time.perf_counter()
         r = evaluate_gemma(
             sequences=eval_seqs,
             model_id=args.model_id,
@@ -132,14 +151,17 @@ def main() -> None:
             action_chunk_size=C,
             model_name="gemma4_vanilla",
         )
+        logger.info("[1/4] Vanilla done in %.1fs — action0=%.1f%%  parse=%.1f%%  halt=%.1f%%  latency=%.0fms",
+                    time.perf_counter() - t_step, r.action_acc, r.parse_rate, r.halt_acc, r.ms_per_sample)
         results.append(r)
         print(r.summary())
     else:
-        print("\n[1/4] Skipping vanilla baseline (--skip-vanilla)")
+        logger.info("[1/4] Skipping vanilla baseline (--skip-vanilla)")
 
     # ── 2. Fine-tuned LoRA ───────────────────────────────────────────────────
     if args.lora_path:
-        print("\n[2/4] Gemma 4 + LoRA (fine-tuned on GT telemetry)")
+        logger.info("[2/4] Starting Gemma 4 + LoRA evaluation | lora=%s", args.lora_path)
+        t_step = time.perf_counter()
         r = evaluate_gemma(
             sequences=eval_seqs,
             model_id=args.model_id,
@@ -148,14 +170,17 @@ def main() -> None:
             action_chunk_size=C,
             model_name="gemma4_lora",
         )
+        logger.info("[2/4] LoRA done in %.1fs — action0=%.1f%%  parse=%.1f%%  halt=%.1f%%  latency=%.0fms",
+                    time.perf_counter() - t_step, r.action_acc, r.parse_rate, r.halt_acc, r.ms_per_sample)
         results.append(r)
         print(r.summary())
     else:
-        print("\n[2/4] Skipping LoRA eval (--lora-path not set)")
+        logger.info("[2/4] Skipping LoRA eval (--lora-path not set)")
 
     # ── 3. TRM student ───────────────────────────────────────────────────────
     if args.trm_checkpoint:
-        print("\n[3/4] TRM student")
+        logger.info("[3/4] Starting TRM student evaluation | checkpoint=%s", args.trm_checkpoint)
+        t_step = time.perf_counter()
         r = evaluate_trm(
             sequences=eval_seqs,
             checkpoint_path=args.trm_checkpoint,
@@ -163,14 +188,17 @@ def main() -> None:
             action_chunk_size=C,
             model_name="trm_student",
         )
+        logger.info("[3/4] TRM done in %.1fs — action0=%.1f%%  halt=%.1f%%  latency=%.0fms",
+                    time.perf_counter() - t_step, r.action_acc, r.halt_acc, r.ms_per_sample)
         results.append(r)
         print(r.summary())
     else:
-        print("\n[3/4] Skipping TRM eval (--trm-checkpoint not set)")
+        logger.info("[3/4] Skipping TRM eval (--trm-checkpoint not set)")
 
     # ── 4. Test-time LoRA adaptation (OOD resilience) ────────────────────────
     if args.tta_shots > 0 and args.lora_path:
-        print(f"\n[4/4] Gemma 4 + LoRA + TTA ({args.tta_shots} shots, {args.tta_steps} steps)")
+        logger.info("[4/4] Starting TTA — %d shots, %d steps", args.tta_shots, args.tta_steps)
+        t_step = time.perf_counter()
         r = adapt_and_evaluate_gemma(
             adapt_sequences=adapt_seqs[:args.tta_shots],
             eval_sequences=eval_seqs,
@@ -181,12 +209,15 @@ def main() -> None:
             temporal_window=T,
             action_chunk_size=C,
         )
+        logger.info("[4/4] TTA done in %.1fs — action0=%.1f%%  parse=%.1f%%  halt=%.1f%%  latency=%.0fms",
+                    time.perf_counter() - t_step, r.action_acc, r.parse_rate, r.halt_acc, r.ms_per_sample)
         results.append(r)
         print(r.summary())
     else:
-        print("\n[4/4] Skipping TTA (--tta-shots 0 or no --lora-path)")
+        logger.info("[4/4] Skipping TTA (--tta-shots 0 or no --lora-path)")
 
     if not results:
+        logger.warning("No models evaluated — pass at least --model-id for vanilla baseline")
         print("\nNo models evaluated. Pass at least --model-id for vanilla baseline.")
         return
 
@@ -218,6 +249,7 @@ def main() -> None:
         ],
     }
     output_path.write_text(json.dumps(report, indent=2))
+    logger.info("Results saved to %s", output_path)
     print(f"\nResults saved to {output_path}")
 
 

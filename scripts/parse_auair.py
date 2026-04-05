@@ -29,12 +29,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import math
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # ── Action vocabulary (mirrors student_training.ACTION_VOCABULARY) ──────────
 # 0: north (+x fwd), 1: south (-x bwd), 2: east (+y right), 3: west (-y left)
@@ -116,8 +125,11 @@ def _clip_id(image_name: str) -> str:
 
 
 def load_annotations(annotations_path: Path) -> list[dict]:
+    t0 = time.perf_counter()
     data = json.loads(annotations_path.read_bytes().decode("utf-8", errors="replace"))
-    return data["annotations"]
+    records = data["annotations"]
+    logger.info("Loaded annotations from %s — %d records in %.2fs", annotations_path, len(records), time.perf_counter() - t0)
+    return records
 
 
 def group_by_clip(annotations: list[dict]) -> dict[str, list[dict]]:
@@ -128,7 +140,9 @@ def group_by_clip(annotations: list[dict]) -> dict[str, list[dict]]:
     # Sort each clip by time
     for cid in clips:
         clips[cid].sort(key=_record_time_s)
-    return dict(clips)
+    result = dict(clips)
+    logger.info("Grouped into %d clips", len(result))
+    return result
 
 
 def build_sequences(
@@ -140,12 +154,15 @@ def build_sequences(
 ) -> list[dict]:
     """Slides a window of T frames over each clip to produce training sequences."""
     sequences: list[dict] = []
+    skipped_clips = 0
 
     for clip_id, frames in clips.items():
         n = len(frames)
         # Need T frames as input + C frames ahead for action chunk targets
         min_len = temporal_window + action_chunk_size
         if n < min_len:
+            logger.warning("Skipping clip %s: only %d frames, need %d (T=%d + C=%d)", clip_id, n, min_len, temporal_window, action_chunk_size)
+            skipped_clips += 1
             continue
 
         for start in range(0, n - min_len + 1, stride):
@@ -158,6 +175,7 @@ def build_sequences(
             for rec in window:
                 p = images_dir / rec["image_name"]
                 if not p.exists():
+                    logger.debug("Missing image, skipping sequence %s-%06d: %s", clip_id, start, p)
                     all_exist = False
                     break
                 image_paths.append(str(p))
@@ -215,6 +233,10 @@ def build_sequences(
                 "categories": cat_names,
             })
 
+    logger.info(
+        "Built %d sequences from %d clips (skipped %d short clips)",
+        len(sequences), len(clips), skipped_clips,
+    )
     return sequences
 
 
@@ -232,14 +254,12 @@ def main() -> None:
     images_dir = Path(args.images_dir)
     annotations_path = Path(args.annotations)
 
-    print(f"Loading annotations from {annotations_path}...")
+    logger.info("images_dir=%s  annotations=%s", images_dir, annotations_path)
     annotations = load_annotations(annotations_path)
-    print(f"  Total records: {len(annotations)}")
 
     clips = group_by_clip(annotations)
-    print(f"  Clips found: {len(clips)}")
     for cid, frames in clips.items():
-        print(f"    {cid}: {len(frames)} frames")
+        logger.debug("Clip %s: %d frames", cid, len(frames))
 
     if args.stats:
         action_hist = defaultdict(int)
@@ -252,7 +272,11 @@ def main() -> None:
             print(f"  {idx} {label}: {action_hist[idx]}")
         return
 
-    print(f"\nBuilding sequences (T={args.temporal_window}, C={args.action_chunk_size}, stride={args.stride})...")
+    logger.info(
+        "Building sequences (T=%d, C=%d, stride=%d)...",
+        args.temporal_window, args.action_chunk_size, args.stride,
+    )
+    t0 = time.perf_counter()
     sequences = build_sequences(
         clips=clips,
         images_dir=images_dir,
@@ -260,7 +284,7 @@ def main() -> None:
         action_chunk_size=args.action_chunk_size,
         stride=args.stride,
     )
-    print(f"  Sequences generated: {len(sequences)}")
+    logger.info("Sequence building done in %.2fs — %d sequences", time.perf_counter() - t0, len(sequences))
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -268,9 +292,9 @@ def main() -> None:
         for seq in sequences:
             f.write(json.dumps(seq) + "\n")
 
-    print(f"  Written to: {output_path}")
+    logger.info("Written to: %s", output_path)
 
-    # Action distribution
+    # Action distribution — keep as print for user-facing summary
     from collections import Counter
     action_counts = Counter(s["action_index"] for s in sequences)
     labels = ["north", "south", "east", "west", "up", "down", "yaw+", "yaw-"]
