@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def apply_submodule_patch():
-    """Ensure torch.nn.Module has set_submodule (required for 4-bit loading)."""
+    """Ensure torch.nn.Module has set_submodule."""
     import torch.nn as _nn
     if not hasattr(_nn.Module, "set_submodule"):
         def _ssm(self, target, module):
@@ -132,9 +132,11 @@ def _load_images(image_paths: list[str], T: int, images_path: str | None = None)
                         resolved = alt2
 
         if not resolved.exists():
-            raise FileNotFoundError(f"Image not found: {resolved} (original path: {p})")
-        
+            raise FileNotFoundError(f"Image not found: {resolved}")
+            
         img = Image.open(resolved).convert("RGB")
+        # Standardize size for the vision tower
+        img = img.resize((224, 224), Image.Resampling.LANCZOS)
         images.append(img)
             
     return images
@@ -142,10 +144,10 @@ def _load_images(image_paths: list[str], T: int, images_path: str | None = None)
 
 def _user_prompt(T: int, C: int) -> str:
     return (
-        f"Analyze the {T} consecutive aerial frames provided and predict the next "
-        f"{C} drone actions.\n\nOutput EXACTLY in this format:\n"
+        f"You are an autonomous drone navigation assistant. "
+        f"Predict the next {C} actions based on these frames.\n\n"
+        "Output EXACTLY in this format:\n"
         + "\n".join(f"Action_{i}: <0-7>  Halt_{i}: <1-6>" for i in range(C))
-        + "\n\nAction index: 0=north 1=south 2=east 3=west 4=up 5=down 6=yaw_right 7=yaw_left"
     )
 
 
@@ -164,7 +166,7 @@ def evaluate_gemma(
     model_name: str | None = None,
     images_path: str | None = None,
 ) -> ModelResult:
-    """Evaluate Gemma 4 on AU-AIR sequences using standard multi-image input."""
+    """Evaluate Gemma 4 on AU-AIR sequences."""
     from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 
     apply_submodule_patch()
@@ -203,24 +205,27 @@ def evaluate_gemma(
     for idx, seq in enumerate(sequences):
         raw_images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
         
-        # Build content with T image tokens
+        # Debug: Save first image of the first sequence to verify loading
+        if total == 0:
+            debug_path = Path("logs/debug_input.jpg")
+            debug_path.parent.mkdir(exist_ok=True)
+            raw_images[-1].save(debug_path)
+            logger.info("[%s] Saved debug image to %s", name, debug_path)
+
+        # Build content: T images THEN text
         content = [{"type": "image"} for _ in range(T)]
         content.append({"type": "text", "text": prompt_tmpl})
         messages = [{"role": "user", "content": content}]
 
         try:
             prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            # Pass ALL images to the processor
             inputs = processor(text=prompt, images=raw_images, return_tensors="pt").to(model.device)
             
-            # Diagnostic for first sample
             if total == 0:
                 pv = inputs.get("pixel_values")
                 if pv is not None:
                     logger.info("[%s] Tensor stats: mean=%.4f std=%.4f shape=%s", 
                                 name, pv.mean().item(), pv.std().item(), list(pv.shape))
-                else:
-                    logger.info("[%s] Inputs keys: %s", name, list(inputs.keys()))
 
             t0 = time.perf_counter()
             with torch.no_grad():
@@ -420,6 +425,8 @@ def adapt_and_evaluate_gemma(
 
     for seq in eval_sequences:
         raw_images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
+        gt_actions = (list(seq.get("action_indices", [seq.get("action_index", 0)] * C)) * C)[:C]
+        gt_halts = (list(seq.get("halt_steps", [seq.get("halt_step", 3)] * C)) * C)[:C]
         content = [{"type": "image"} for _ in range(T)]
         content.append({"type": "text", "text": prompt_tmpl})
         messages = [{"role": "user", "content": content}]
