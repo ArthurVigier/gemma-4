@@ -189,22 +189,18 @@ def evaluate_gemma(
     images_path: str | None = None,
 ) -> ModelResult:
     """Evaluate Gemma 4 on AU-AIR sequences."""
-    from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
+    from transformers import AutoProcessor, AutoModelForImageTextToText
 
     apply_submodule_patch()
     name = model_name or ("gemma4_lora" if lora_path else "gemma4_vanilla")
     T, C = temporal_window, action_chunk_size
 
-    logger.info("[%s] Loading model %s...", name, model_id)
+    logger.info("[%s] Loading model %s in bfloat16...", name, model_id)
     t_load = time.perf_counter()
 
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
     model = AutoModelForImageTextToText.from_pretrained(
-        model_id, quantization_config=bnb,
+        model_id,
         device_map={"": 0}, dtype=torch.bfloat16,
         attn_implementation="sdpa", trust_remote_code=True,
     )
@@ -391,21 +387,17 @@ def adapt_and_evaluate_gemma(
     images_path: str | None = None,
 ) -> ModelResult:
     """NVARC-inspired test-time LoRA adaptation."""
-    from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
+    from transformers import AutoProcessor, AutoModelForImageTextToText
     from peft import PeftModel
 
     apply_submodule_patch()
     T, C = temporal_window, action_chunk_size
     name = f"gemma4_lora_tta_{len(adapt_sequences)}shot"
 
-    logger.info("[%s] Loading model for TTA...", name)
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True, bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
+    logger.info("[%s] Loading model for TTA in bfloat16...", name)
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
     base_model = AutoModelForImageTextToText.from_pretrained(
-        model_id, quantization_config=bnb,
+        model_id,
         device_map={"": 0}, dtype=torch.bfloat16,
         attn_implementation="sdpa", trust_remote_code=True,
     )
