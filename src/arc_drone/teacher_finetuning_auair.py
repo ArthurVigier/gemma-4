@@ -183,128 +183,224 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = select_device("cuda")
 
-    import torch
-    # Workaround for PyTorch 2.6.0 + Unsloth bug where torch._inductor.config is missing
-    try:
-        import torch._dynamo
-        import torch._inductor.config
-    except ImportError:
-        pass
-        
-    # Workaround for torchao / transformers crash on PyTorch 2.6 where sub-byte dtypes are missing
-    class _FakeDtype:
-        pass
-    for i in range(1, 8):
-        if not hasattr(torch, f"int{i}"):
-            setattr(torch, f"int{i}", _FakeDtype())
-            logger.debug("Applied torch.int%d monkey-patch for torchao compatibility.", i)
+    AutoModelForImageTextToText, AutoProcessor, _ = _lazy_import_transformers()
+    from peft import LoraConfig, get_peft_model
+    from transformers import get_cosine_schedule_with_warmup
 
-    from unsloth import FastVisionModel
+    logger.info("--- AU-AIR Teacher Fine-tuning (HuggingFace Native) ---")
+    logger.info("Model:  %s", config.foundation_model_id)
+    logger.info("Data:   %s", config.auair_path)
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+    logger.info("Device: %s (%s)", device, gpu_name)
 
-    logger.info("--- AU-AIR Teacher Fine-tuning (Unsloth Speedup) ---")
-    
-    # 1. Load Model
-    model, processor = FastVisionModel.from_pretrained(
-        model_name = config.foundation_model_id,
-        load_in_4bit = True,
-        use_gradient_checkpointing = "unsloth",
-    )
-
-    # 2. Add LoRA
-    model = FastVisionModel.get_peft_model(
-        model,
-        r = config.lora_r,
-        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-        lora_alpha = config.lora_alpha,
-        lora_dropout = 0,
-        bias = "none",
-        random_state = config.seed,
-        finetune_vision_layers = False,
-    )
-
-    # ── Split Data ──────────────────────────────────────────────────────────
-    all_lines = []
+    # ── Load all records and split ──────────────────────────────────────────
+    all_lines: list[str] = []
     with open(config.auair_path, encoding="utf-8") as f:
         for line in f:
-            if line.strip(): all_lines.append(line)
+            line = line.strip()
+            if line:
+                all_lines.append(line)
 
     rng = np.random.default_rng(config.seed)
     idx = rng.permutation(len(all_lines))
     eval_n = min(config.eval_task_count, max(1, int(len(all_lines) * config.eval_ratio)))
     train_n = min(config.task_count, len(all_lines) - eval_n)
-    
+    logger.info("Dataset split — train: %d  eval: %d  (total available: %d)", train_n, eval_n, len(all_lines))
+
     import tempfile
     tmp = Path(tempfile.mkdtemp())
     (tmp / "train.jsonl").write_text("\n".join(all_lines[i] for i in idx[:train_n]))
     (tmp / "eval.jsonl").write_text("\n".join(all_lines[i] for i in idx[train_n: train_n + eval_n]))
 
-    train_ds = AuAirTeacherDataset(tmp / "train.jsonl", processor, config.max_length, config.temporal_window, config.action_chunk_size, config.auair_images_path)
-    eval_ds = AuAirTeacherDataset(tmp / "eval.jsonl", processor, config.max_length, config.temporal_window, config.action_chunk_size, config.auair_images_path)
-    
+    # ── Model ───────────────────────────────────────────────────────────────
+    logger.info("Loading processor for %s...", config.foundation_model_id)
+    t_load = time.time()
+    processor = AutoProcessor.from_pretrained(config.foundation_model_id, trust_remote_code=True)
+
+    logger.info("Loading model in native bfloat16 (full precision vision)...")
+    model = AutoModelForImageTextToText.from_pretrained(
+        config.foundation_model_id,
+        device_map={"": 0},
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+        trust_remote_code=True,
+    )
+    model.gradient_checkpointing_enable()
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    lora_config = LoraConfig(
+        r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    for name, param in model.named_parameters():
+        if "lora" in name:
+            param.data = param.data.to(torch.bfloat16)
+    model.print_trainable_parameters()
+    logger.info("Model loaded in %.1fs", time.time() - t_load)
+
+    # ── Datasets ────────────────────────────────────────────────────────────
+    train_ds = AuAirTeacherDataset(
+        tmp / "train.jsonl", processor, config.max_length,
+        temporal_window=config.temporal_window,
+        action_chunk_size=config.action_chunk_size,
+        images_path=config.auair_images_path,
+    )
+    eval_ds = AuAirTeacherDataset(
+        tmp / "eval.jsonl", processor, config.max_length,
+        temporal_window=config.temporal_window,
+        action_chunk_size=config.action_chunk_size,
+        images_path=config.auair_images_path,
+    )
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True)
     eval_loader = DataLoader(eval_ds, batch_size=config.batch_size, shuffle=False)
 
-    # 3. Training
+    # ── Optimizer ───────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-    from transformers import get_cosine_schedule_with_warmup
-    total_steps = (len(train_loader) // config.gradient_accumulation_steps) * config.epochs
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.05), num_training_steps=total_steps)
 
-    logger.info("Starting training...")
+    total_steps = (len(train_loader) // config.gradient_accumulation_steps) * config.epochs
+    warmup_steps = max(1, int(total_steps * 0.05))
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+    )
+
+    # ── Training ────────────────────────────────────────────────────────────
+    logger.info("Starting training — %d epochs, %d steps/epoch, warmup=%d", config.epochs, len(train_loader) // config.gradient_accumulation_steps, warmup_steps)
     best_eval_loss = float("inf")
-    epoch_history = []
+    epoch_history: list[dict] = []
     C = config.action_chunk_size
 
     for epoch in range(1, config.epochs + 1):
+        logger.info("Epoch %d/%d starting...", epoch, config.epochs)
+        t_epoch = time.time()
         model.train()
         total_train_loss = 0.0
         correct_actions = 0
         total_processed = 0
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs}")
+        optimizer.zero_grad()
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs} [Train]")
         for batch_idx, batch in enumerate(pbar):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            outputs = model(**batch)
+            if "pixel_values" in batch:
+                batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
+
+            outputs = model(**batch, return_dict=True)
             loss = outputs.loss / config.gradient_accumulation_steps
             loss.backward()
 
-            if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
+            if (batch_idx + 1) % config.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
-            total_train_loss += outputs.loss.item()
-            
-            # Sample accuracy on Action_0
+            total_train_loss += loss.item() * config.gradient_accumulation_steps
+
+            # Sample metrics (first item in batch)
             with torch.no_grad():
                 logits = outputs.logits[0]
-                labels = batch["labels"][0]
-                vmask = labels != -100
+                labels_i = batch["labels"][0]
+                sl, sl2 = logits[:-1], labels_i[1:]
+                vmask = sl2 != -100
                 if vmask.any():
-                    pred_text = processor.tokenizer.decode(torch.argmax(logits[:-1], dim=-1)[vmask[1:]], skip_special_tokens=True)
-                    true_text = processor.tokenizer.decode(labels[vmask], skip_special_tokens=True)
+                    pred_ids = torch.argmax(sl, dim=-1)[vmask]
+                    true_ids = sl2[vmask]
+                    pred_text = processor.tokenizer.decode(pred_ids, skip_special_tokens=True)
+                    true_text = processor.tokenizer.decode(true_ids, skip_special_tokens=True)
                     pa, _ = _parse_chunk(pred_text, C)
                     ta, _ = _parse_chunk(true_text, C)
-                    if pa and ta and pa[0] == ta[0]: correct_actions += 1
+                    if pa is not None and ta is not None and pa[0] == ta[0]:
+                        correct_actions += 1
                     total_processed += 1
 
-            pbar.set_postfix({"loss": f"{outputs.loss.item():.4f}", "acc": f"{correct_actions/max(total_processed,1)*100:.1f}%"})
+            pbar.set_postfix({"loss": f"{loss.item()*config.gradient_accumulation_steps:.4f}",
+                              "act0_acc": f"{correct_actions/max(total_processed,1)*100:.1f}%"})
 
-        # Eval
+        avg_train_loss = total_train_loss / len(train_loader)
+        train_act_acc = correct_actions / max(total_processed, 1) * 100
+
+        # ── Eval ────────────────────────────────────────────────────────────
         model.eval()
         total_eval_loss = 0.0
+        eval_correct = [0] * C
+        eval_parseable = 0
+        eval_total = 0
+
         with torch.no_grad():
-            for batch in eval_loader:
+            for batch in tqdm(eval_loader, desc=f"Epoch {epoch}/{config.epochs} [Eval]"):
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                outputs = model(**batch)
+                if "pixel_values" in batch:
+                    batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
+                outputs = model(**batch, return_dict=True)
                 total_eval_loss += outputs.loss.item()
-        
-        avg_eval_loss = total_eval_loss / len(eval_loader)
-        logger.info("Epoch %d: eval_loss=%.4f", epoch, avg_eval_loss)
-        
+
+                for i in range(batch["labels"].shape[0]):
+                    sl = outputs.logits[i][:-1]
+                    sl2 = batch["labels"][i][1:]
+                    vmask = sl2 != -100
+                    if not vmask.any():
+                        continue
+                    pred_text = processor.tokenizer.decode(torch.argmax(sl, dim=-1)[vmask], skip_special_tokens=True)
+                    true_text = processor.tokenizer.decode(sl2[vmask], skip_special_tokens=True)
+                    pa, _ = _parse_chunk(pred_text, C)
+                    ta, _ = _parse_chunk(true_text, C)
+                    if pa is not None:
+                        eval_parseable += 1
+                    if pa is not None and ta is not None:
+                        for c in range(C):
+                            if pa[c] == ta[c]:
+                                eval_correct[c] += 1
+                    eval_total += 1
+
+        avg_eval_loss = total_eval_loss / max(len(eval_loader), 1)
+        eval_parse_rate = eval_parseable / max(eval_total, 1) * 100
+        chunk_acc = [eval_correct[c] / max(eval_parseable, 1) * 100 for c in range(C)]
+
+        t_epoch_elapsed = time.time() - t_epoch
+        chunk_acc_str = "  ".join(f"a{c}={chunk_acc[c]:.1f}%" for c in range(C))
+        logger.info(
+            "Epoch %d/%d done in %.1fs | train_loss=%.4f  eval_loss=%.4f  "
+            "train_act0=%.1f%%  eval_parse=%.1f%%  eval_chunk=[%s]",
+            epoch, config.epochs, t_epoch_elapsed,
+            avg_train_loss, avg_eval_loss,
+            train_act_acc, eval_parse_rate,
+            chunk_acc_str,
+        )
+
+        epoch_metrics = {
+            "epoch": epoch,
+            "train_loss": round(avg_train_loss, 4),
+            "eval_loss": round(avg_eval_loss, 4),
+            "train_action0_acc": round(train_act_acc, 2),
+            "eval_parse_rate": round(eval_parse_rate, 2),
+            "eval_samples": eval_total,
+            "eval_chunk_acc": [round(v, 2) for v in chunk_acc],
+        }
+        epoch_history.append(epoch_metrics)
+
         if avg_eval_loss < best_eval_loss:
             best_eval_loss = avg_eval_loss
+            logger.info("New best eval loss %.4f — saving adapters to %s", best_eval_loss, output_dir)
             model.save_pretrained(output_dir)
             processor.save_pretrained(output_dir)
 
-    return {"best_eval_loss": best_eval_loss, "output_dir": str(output_dir)}
+    summary = {
+        "foundation_model_id": config.foundation_model_id,
+        "output_dir": output_dir.as_posix(),
+        "auair_path": config.auair_path,
+        "train_count": train_n,
+        "eval_count": eval_n,
+        "temporal_window": config.temporal_window,
+        "action_chunk_size": config.action_chunk_size,
+        "epochs": config.epochs,
+        "best_eval_loss": best_eval_loss,
+        "epoch_history": epoch_history,
+    }
+    (output_dir / "finetune_summary.json").write_text(json.dumps(summary, indent=2))
+    return summary
