@@ -202,6 +202,11 @@ def _load_multimodal_teacher(
     """Load Gemma multimodal model + processor using Unsloth for speed if possible."""
     if device.type == "cuda":
         try:
+            import torch._dynamo
+            import torch._inductor.config
+        except ImportError:
+            pass
+        try:
             from unsloth import FastVisionModel
             model, processor = FastVisionModel.from_pretrained(
                 model_name = foundation_model_id,

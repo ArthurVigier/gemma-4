@@ -183,8 +183,15 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = select_device("cuda")
 
-    from unsloth import FastVisionModel
     import torch
+    # Workaround for PyTorch 2.6.0 + Unsloth bug where torch._inductor.config is missing
+    try:
+        import torch._dynamo
+        import torch._inductor.config
+    except ImportError:
+        pass
+
+    from unsloth import FastVisionModel
 
     logger.info("--- AU-AIR Teacher Fine-tuning (Unsloth Speedup) ---")
     
