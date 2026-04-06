@@ -201,14 +201,12 @@ def evaluate_gemma(
     logger.info("[%s] Loading model %s via Unsloth...", name, model_id)
     t_load = time.perf_counter()
 
+    # Optimized Unsloth loading: if lora_path is present, load both at once
     model, processor = FastVisionModel.from_pretrained(
-        model_name = model_id,
+        model_name = lora_path if lora_path else model_id,
         load_in_4bit = True,
     )
     
-    if lora_path is not None:
-        model.load_adapter(lora_path)
-
     FastVisionModel.for_inference(model)
     model.eval()
     logger.info("[%s] Model ready in %.1fs", name, time.perf_counter() - t_load)
