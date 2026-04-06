@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def apply_submodule_patch():
-    """Ensure torch.nn.Module has set_submodule."""
+    """Ensure torch.nn.Module has set_submodule (required for 4-bit loading)."""
     import torch.nn as _nn
     if not hasattr(_nn.Module, "set_submodule"):
         def _ssm(self, target, module):
@@ -111,32 +111,6 @@ def _load_sequences(jsonl_path: Path, max_samples: int, seed: int = 42) -> list[
     return selected
 
 
-def _make_mosaic(images: list[Image.Image]) -> Image.Image:
-    """Compose T frames into a 2×2 mosaic, resizing them first to 448x448."""
-    T = len(images)
-    if T == 0:
-        return Image.new("RGB", (448, 448), color=(80, 80, 80))
-    
-    # Resize all to a standard model-friendly size before mosaic
-    res = 448
-    imgs = [img.resize((res, res), Image.Resampling.LANCZOS) for img in images]
-    
-    if T == 1:
-        return imgs[0]
-    
-    # 2x2 mosaic
-    mosaic = Image.new("RGB", (res * 2, res * 2))
-    for i in range(min(4, T)):
-        mosaic.paste(imgs[i], ((i % 2) * res, (i // 2) * res))
-    
-    # Pad if T < 4
-    if T < 4:
-        for i in range(T, 4):
-            mosaic.paste(imgs[-1], ((i % 2) * res, (i // 2) * res))
-            
-    return mosaic
-
-
 def _load_images(image_paths: list[str], T: int, images_path: str | None = None) -> list[Image.Image]:
     if len(image_paths) < T:
         image_paths = [image_paths[0]] * (T - len(image_paths)) + image_paths
@@ -163,17 +137,15 @@ def _load_images(image_paths: list[str], T: int, images_path: str | None = None)
             img = Image.open(resolved).convert("RGB")
             images.append(img)
         except Exception as e:
-            logger.warning("Failed to load image at %s: %s", resolved, e)
-            images.append(Image.new("RGB", (640, 480), color=(80, 80, 80)))
+            logger.warning("Failed to load image at %s (orig: %s): %s", resolved, p, e)
+            images.append(Image.new("RGB", (224, 224), color=(80, 80, 80)))
             
     return images
 
 
 def _user_prompt(T: int, C: int) -> str:
     return (
-        f"You are an autonomous drone navigation assistant. "
-        f"You are given {T} consecutive aerial frames.\n\n"
-        "Analyze object positions and motion across frames, then predict the next "
+        f"Analyze the {T} consecutive aerial frames provided and predict the next "
         f"{C} drone actions.\n\nOutput EXACTLY in this format:\n"
         + "\n".join(f"Action_{i}: <0-7>  Halt_{i}: <1-6>" for i in range(C))
         + "\n\nAction index: 0=north 1=south 2=east 3=west 4=up 5=down 6=yaw_right 7=yaw_left"
@@ -195,7 +167,7 @@ def evaluate_gemma(
     model_name: str | None = None,
     images_path: str | None = None,
 ) -> ModelResult:
-    """Evaluate Gemma 4 on AU-AIR sequences."""
+    """Evaluate Gemma 4 on AU-AIR sequences using standard multi-image input."""
     from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 
     apply_submodule_patch()
@@ -233,25 +205,25 @@ def evaluate_gemma(
 
     for idx, seq in enumerate(sequences):
         raw_images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
-        mosaic = _make_mosaic(raw_images)
         
-        gt_actions = seq.get("action_indices", [seq.get("action_index", 0)] * C)
-        gt_halts = seq.get("halt_steps", [seq.get("halt_step", 3)] * C)
-        gt_actions = (list(gt_actions) * C)[:C]
-        gt_halts = (list(gt_halts) * C)[:C]
-
-        content = [{"type": "image"}, {"type": "text", "text": prompt_tmpl}]
+        # Build content with T image tokens
+        content = [{"type": "image"} for _ in range(T)]
+        content.append({"type": "text", "text": prompt_tmpl})
         messages = [{"role": "user", "content": content}]
 
         try:
             prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = processor(text=prompt, images=mosaic, return_tensors="pt").to(model.device)
+            # Pass ALL images to the processor
+            inputs = processor(text=prompt, images=raw_images, return_tensors="pt").to(model.device)
             
             # Diagnostic for first sample
             if total == 0:
-                pv = inputs["pixel_values"]
-                logger.info("[%s] Tensor stats: mean=%.4f std=%.4f shape=%s", 
-                            name, pv.mean().item(), pv.std().item(), list(pv.shape))
+                pv = inputs.get("pixel_values")
+                if pv is not None:
+                    logger.info("[%s] Tensor stats: mean=%.4f std=%.4f shape=%s", 
+                                name, pv.mean().item(), pv.std().item(), list(pv.shape))
+                else:
+                    logger.info("[%s] Inputs keys: %s", name, list(inputs.keys()))
 
             t0 = time.perf_counter()
             with torch.no_grad():
@@ -451,15 +423,13 @@ def adapt_and_evaluate_gemma(
 
     for seq in eval_sequences:
         raw_images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
-        mosaic = _make_mosaic(raw_images)
-        gt_actions = (list(seq.get("action_indices", [seq.get("action_index", 0)] * C)) * C)[:C]
-        gt_halts = (list(seq.get("halt_steps", [seq.get("halt_step", 3)] * C)) * C)[:C]
-        content = [{"type": "image"}, {"type": "text", "text": prompt_tmpl}]
+        content = [{"type": "image"} for _ in range(T)]
+        content.append({"type": "text", "text": prompt_tmpl})
         messages = [{"role": "user", "content": content}]
 
         try:
             prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = processor(text=prompt, images=mosaic, return_tensors="pt").to(model.device)
+            inputs = processor(text=prompt, images=raw_images, return_tensors="pt").to(model.device)
             t0 = time.perf_counter()
             with torch.no_grad():
                 out_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id)
