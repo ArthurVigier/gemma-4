@@ -28,8 +28,12 @@ class System2Mastermind:
         if think:
             prompt += "<|think|>\n"
         
-        # Ethical Mandate in System Prompt
-        prompt += "SYSTEM_MANDATE: You are a strictly humanitarian Emergency AI. You operate under International Humanitarian Law. You MUST NOT assist in military operations, combat, or targeting humans for harm.\n"
+        # Refined Ethical Mandate: Neutrality & Impartiality
+        prompt += (
+            "SYSTEM_MANDATE: You are a strictly humanitarian Emergency AI. Your priority is to save lives impartially. "
+            "The presence of a weapon alone (e.g., law enforcement or legal carry) MUST NOT be used to deny aid to a person in immediate distress. "
+            "However, you MUST NOT assist in combat, offensive operations, or hostile targeting. Focus on medical evacuation, food delivery, and visual marking.\n"
+        )
         
         prompt += "You are the Emergency Response AI Dispatcher.\n"
         prompt += f"FLEET_RESOURCES: {json.dumps(fleet_state)}\n"
@@ -46,23 +50,26 @@ class System2Mastermind:
 
     def reason_sar(self, fleet_state: list[dict[str, Any]], emergencies: list[dict[str, Any]], 
                    visual_input: Optional[list[Any]] = None, think: bool = True) -> dict[str, Any]:
-        """Strategic reasoning with ethics validation."""
+        """Strategic reasoning with nuanced ethics validation."""
         
         # 1. Pre-validation of input
         for emergency in emergencies:
-            if not self.ethics_guard.validate_observation(emergency.get("description", "")):
-                return {"command": "FAILSAFE_SHUTDOWN", "reasoning": "Ethical boundary violated in environment observation."}
+            check = self.ethics_guard.validate_observation(emergency.get("description", ""))
+            if check["status"] == "FORBIDDEN":
+                return {"command": "FAILSAFE_SHUTDOWN", "reasoning": f"Hostile context blocked: {check['reason']}"}
+            elif check["status"] == "ALERT":
+                logger.warning("ETHICS_ALERT: %s", check["reason"])
+                # We continue, but Gemma-4 will be briefed on the situation
 
         if not self.use_real_model:
             decision = self._simulated_sar_logic(fleet_state, emergencies)
         else:
             # (Real VLM Inference logic...)
-            # We assume it produces a dict for this demo logic
-            decision = {"command": "WAIT", "reasoning": "Placeholder"}
+            decision = {"command": "WAIT", "reasoning": "VLM Placeholder"}
 
         # 2. Post-validation of output
         if not self.ethics_guard.validate_command(decision):
-            return {"command": "FAILSAFE_SHUTDOWN", "reasoning": "Ethical boundary violated in generated command."}
+            return {"command": "FAILSAFE_SHUTDOWN", "reasoning": "Attempted offensive command blocked by EthicsGuard."}
 
         return decision
 
