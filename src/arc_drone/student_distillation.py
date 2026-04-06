@@ -204,9 +204,11 @@ def _project_teacher_logits(
 
 
 def _stack_base_dataset(base_dataset: ArcStudentDataset) -> dict[str, torch.Tensor | list[str]]:
-    grids = torch.stack([base_dataset[index]["grid"] for index in range(len(base_dataset))])
-    action_indices = torch.stack([base_dataset[index]["action_index"] for index in range(len(base_dataset))])
-    action_target_vectors = torch.stack([base_dataset[index]["action_target_vector"] for index in range(len(base_dataset))])
+    grids = torch.stack([base_dataset[index]["grids"] for index in range(len(base_dataset))])
+    # action_indices is (C,) per sample — take a0 (current action) as scalar target
+    action_indices = torch.stack([base_dataset[index]["action_indices"][0] for index in range(len(base_dataset))])
+    # action_target_vectors is (C, 4) per sample — take a0
+    action_target_vectors = torch.stack([base_dataset[index]["action_target_vectors"][0] for index in range(len(base_dataset))])
     halt_steps = torch.stack([base_dataset[index]["halt_step"] for index in range(len(base_dataset))])
     task_ids = [base_dataset.tasks[index].task_id for index in range(len(base_dataset))]
     return {
@@ -295,7 +297,7 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
         pooling=config.teacher_feature_pooling,
     )
 
-    train_action_indices = torch.stack([train_base[index]["action_index"] for index in range(len(train_base))])
+    train_action_indices = torch.stack([train_base[index]["action_indices"][0] for index in range(len(train_base))])
     train_halt_steps = torch.stack([train_base[index]["halt_step"] for index in range(len(train_base))])
     logger.info("Fitting teacher probe (layers=%s, pooling=%s)...", list(layer_indices), config.teacher_feature_pooling)
     t0 = time.perf_counter()
