@@ -90,6 +90,8 @@ class DistillationConfig:
     teacher_probe_batch_size: int = 64
     teacher_temperature: float = 3.0
     teacher_max_length: int = 768
+    temporal_window: int = 4
+    action_chunk_size: int = 4
 
 
 class CachedDistillationDataset(Dataset[dict[str, torch.Tensor]]):
