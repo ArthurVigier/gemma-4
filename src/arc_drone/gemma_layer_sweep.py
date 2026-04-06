@@ -206,6 +206,10 @@ def _load_multimodal_teacher(
             import torch._inductor.config
         except ImportError:
             pass
+        if not hasattr(torch, "int1"):
+            class _FakeDtype:
+                pass
+            torch.int1 = _FakeDtype()
         try:
             from unsloth import FastVisionModel
             model, processor = FastVisionModel.from_pretrained(

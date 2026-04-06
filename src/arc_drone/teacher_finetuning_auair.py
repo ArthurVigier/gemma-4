@@ -190,6 +190,13 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
         import torch._inductor.config
     except ImportError:
         pass
+        
+    # Workaround for torchao / transformers crash on PyTorch 2.6 where torch.int1 is missing
+    if not hasattr(torch, "int1"):
+        logger.debug("Applying torch.int1 monkey-patch for torchao compatibility.")
+        class _FakeDtype:
+            pass
+        torch.int1 = _FakeDtype()
 
     from unsloth import FastVisionModel
 
