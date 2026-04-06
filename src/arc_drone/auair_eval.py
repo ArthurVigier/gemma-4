@@ -27,6 +27,24 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Workaround: transformers 5.5.0 bitsandbytes set_submodule bug
+# ---------------------------------------------------------------------------
+
+def apply_submodule_patch():
+    """Ensure torch.nn.Module has set_submodule (required by some transformers versions)."""
+    import torch.nn as _nn
+    if not hasattr(_nn.Module, "set_submodule"):
+        def _ssm(self, target, module):
+            atoms = target.split(".")
+            mod = self
+            for a in atoms[:-1]:
+                mod = mod.get_submodule(a)
+            setattr(mod, atoms[-1], module)
+        _nn.Module.set_submodule = _ssm
+        logger.debug("Applied torch.nn.Module.set_submodule monkey-patch.")
+
+
+# ---------------------------------------------------------------------------
 # Result dataclasses
 # ---------------------------------------------------------------------------
 
@@ -166,6 +184,7 @@ def evaluate_gemma(
     """
     from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 
+    apply_submodule_patch()
     name = model_name or ("gemma4_lora" if lora_path else "gemma4_vanilla")
     T, C = temporal_window, action_chunk_size
 
@@ -399,6 +418,7 @@ def adapt_and_evaluate_gemma(
     from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
     from peft import PeftModel
 
+    apply_submodule_patch()
     T, C = temporal_window, action_chunk_size
     name = f"gemma4_lora_tta_{len(adapt_sequences)}shot"
 
