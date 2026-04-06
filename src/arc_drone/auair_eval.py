@@ -142,20 +142,25 @@ def _load_images(image_paths: list[str], T: int, images_path: str | None = None)
     
     missing_count = 0
     for p in image_paths[-T:]:
-        # Robust resolution: try exact path, then filename in base dir
         orig_path = Path(p)
         resolved = orig_path
         if base:
+            # Try joining filename with base
             resolved = base / orig_path.name
-            
-        if not resolved.exists():
-            # Second attempt: check if it's in a subdirectory of base matching the original parent name
-            if base and len(orig_path.parts) > 1:
-                alt_resolved = base / orig_path.parent.name / orig_path.name
-                if alt_resolved.exists():
-                    resolved = alt_resolved
+            if not resolved.exists():
+                # Fallback: check if base already included 'images' or similar
+                alt = base / "images" / orig_path.name
+                if alt.exists():
+                    resolved = alt
+                elif len(orig_path.parts) > 1:
+                    # Fallback: check video_id/filename
+                    alt2 = base / orig_path.parent.name / orig_path.name
+                    if alt2.exists():
+                        resolved = alt2
 
         try:
+            if not resolved.exists():
+                raise FileNotFoundError(f"File not found: {resolved}")
             img = Image.open(resolved).convert("RGB")
             images.append(img)
         except Exception as e:
@@ -164,7 +169,7 @@ def _load_images(image_paths: list[str], T: int, images_path: str | None = None)
             images.append(Image.new("RGB", (640, 480), color=(80, 80, 80)))
             
     if missing_count == T and T > 0:
-        logger.error("ALL images in sequence failed to load! Check --images-path.")
+        logger.error("ALL images in sequence failed to load! Images path: %s", base)
         
     return images
 
@@ -233,6 +238,16 @@ def evaluate_gemma(
 
     for idx, seq in enumerate(sequences):
         raw_images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
+        
+        # Diagnostic for first sample
+        if total == 0:
+            pixel_data = np.array(raw_images[0])
+            mean_val = np.mean(pixel_data)
+            std_val = np.std(pixel_data)
+            logger.info("[%s] First image stats: mean=%.2f std=%.2f", name, mean_val, std_val)
+            if mean_val == 80.0 and std_val == 0.0:
+                logger.error("[%s] Detected fallback gray image! Check your images path.", name)
+
         mosaic = _make_mosaic(raw_images)
         
         gt_actions = seq.get("action_indices", [seq.get("action_index", 0)] * C)
