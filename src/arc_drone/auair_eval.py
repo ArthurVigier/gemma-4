@@ -5,6 +5,8 @@ Supports three model types:
   - Gemma 4 vanilla      (no fine-tuning, zero-shot)
   - Gemma 4 + LoRA       (fine-tuned on GT telemetry via finetune_gemma_auair.py)
   - TRMReasoner          (student checkpoint from train_trm_student.py)
+
+Each is evaluated against GT telemetry action labels from parse_auair.py.
 """
 
 from __future__ import annotations
@@ -188,28 +190,26 @@ def evaluate_gemma(
     model_name: str | None = None,
     images_path: str | None = None,
 ) -> ModelResult:
-    """Evaluate Gemma 4 on AU-AIR sequences."""
-    from transformers import AutoProcessor, AutoModelForImageTextToText
+    """Evaluate Gemma 4 on AU-AIR sequences using Unsloth for 2x speedup."""
+    from unsloth import FastVisionModel
+    import torch
 
     apply_submodule_patch()
     name = model_name or ("gemma4_lora" if lora_path else "gemma4_vanilla")
     T, C = temporal_window, action_chunk_size
 
-    logger.info("[%s] Loading model %s in bfloat16...", name, model_id)
+    logger.info("[%s] Loading model %s via Unsloth...", name, model_id)
     t_load = time.perf_counter()
 
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_id,
-        device_map={"": 0}, dtype=torch.bfloat16,
-        attn_implementation="sdpa", trust_remote_code=True,
+    model, processor = FastVisionModel.from_pretrained(
+        model_name = model_id,
+        load_in_4bit = True,
     )
-
+    
     if lora_path is not None:
-        from peft import PeftModel
-        logger.info("[%s] Loading adapters from %s...", name, lora_path)
-        model = PeftModel.from_pretrained(model, lora_path)
+        model.load_adapter(lora_path)
 
+    FastVisionModel.for_inference(model)
     model.eval()
     logger.info("[%s] Model ready in %.1fs", name, time.perf_counter() - t_load)
 
@@ -224,7 +224,6 @@ def evaluate_gemma(
         raw_images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
         mosaic = _make_mosaic(raw_images)
         
-        # FIX: Define labels inside the loop
         gt_actions_raw = seq.get("action_indices", [seq.get("action_index", 0)] * C)
         gt_halts_raw = seq.get("halt_steps", [seq.get("halt_step", 3)] * C)
         gt_actions = (list(gt_actions_raw) * C)[:C]
@@ -236,9 +235,7 @@ def evaluate_gemma(
             mosaic.save(debug_path)
             logger.info("[%s] Saved mosaic debug image to %s", name, debug_path)
 
-        # Single image (mosaic) input
-        content = [{"type": "image"}, {"type": "text", "text": prompt_tmpl}]
-        messages = [{"role": "user", "content": content}]
+        messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt_tmpl}]}]
 
         try:
             prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -386,27 +383,24 @@ def adapt_and_evaluate_gemma(
     device: str = "cuda",
     images_path: str | None = None,
 ) -> ModelResult:
-    """NVARC-inspired test-time LoRA adaptation."""
-    from transformers import AutoProcessor, AutoModelForImageTextToText
-    from peft import PeftModel
+    """NVARC-inspired test-time LoRA adaptation using Unsloth."""
+    from unsloth import FastVisionModel
+    import torch
 
     apply_submodule_patch()
     T, C = temporal_window, action_chunk_size
     name = f"gemma4_lora_tta_{len(adapt_sequences)}shot"
 
-    logger.info("[%s] Loading model for TTA in bfloat16...", name)
-    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
-    base_model = AutoModelForImageTextToText.from_pretrained(
-        model_id,
-        device_map={"": 0}, dtype=torch.bfloat16,
-        attn_implementation="sdpa", trust_remote_code=True,
+    logger.info("[%s] Loading model for TTA via Unsloth...", name)
+    model, processor = FastVisionModel.from_pretrained(
+        model_name = model_id,
+        load_in_4bit = True,
     )
-    model = PeftModel.from_pretrained(base_model, base_lora_path, is_trainable=True)
+    model.load_adapter(base_lora_path)
 
+    # Enable LoRA training
     for name_p, param in model.named_parameters():
         param.requires_grad = "lora" in name_p
-        if param.requires_grad and param.dtype != torch.bfloat16:
-            param.data = param.data.to(torch.bfloat16)
 
     optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=adapt_lr)
 
@@ -417,7 +411,7 @@ def adapt_and_evaluate_gemma(
 
     from .teacher_finetuning_auair import AuAirTeacherDataset
     adapt_ds = AuAirTeacherDataset(
-        adapt_jsonl, processor, max_length=512,
+        adapt_jsonl, processor, max_length=1024,
         temporal_window=T, action_chunk_size=C,
         images_path=images_path,
     )
@@ -436,6 +430,7 @@ def adapt_and_evaluate_gemma(
             optimizer.step()
             step += 1
 
+    FastVisionModel.for_inference(model)
     model.eval()
     logger.info("[%s] Adaptation done", name)
 
@@ -455,8 +450,7 @@ def adapt_and_evaluate_gemma(
         gt_actions = (list(gt_actions_raw) * C)[:C]
         gt_halts = (list(gt_halts_raw) * C)[:C]
         
-        content = [{"type": "image"}, {"type": "text", "text": prompt_tmpl}]
-        messages = [{"role": "user", "content": content}]
+        messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": prompt_tmpl}]}]
 
         try:
             prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)

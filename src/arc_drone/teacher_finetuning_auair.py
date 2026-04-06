@@ -1,22 +1,14 @@
 """
-QLoRA fine-tuning of Gemma 4 teacher on AU-AIR GT telemetry labels.
+Fine-tuning of Gemma 4 teacher on AU-AIR using Unsloth for 2x speedup.
 
-Pipeline:
-  auair_sequences.jsonl  (parse_auair.py output, GT actions from IMU)
-        ↓
-  Gemma 4 E4B + LoRA
-        ↓
-  artifacts/teacher_lora/gemma_e4b_auair/
-
-No circular annotation — labels come directly from drone telemetry.
-The model learns: [T frames] → action chunk (GT) with optional CoT prefix.
+Unsloth FastVisionModel preserves the vision encoder's precision while
+quantizing the LLM to 4-bit, avoiding the 'blind model' bug.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import platform
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -34,7 +26,6 @@ except Exception:
     def tqdm(iterable=None, *args, **kwargs):
         return iterable
 
-from .gemma_layer_sweep import _lazy_import_transformers
 from .student_training import select_device, set_seed
 
 logger = logging.getLogger(__name__)
@@ -42,19 +33,15 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Prompt
 # ---------------------------------------------------------------------------
-# ... rest of code ...
 
 def _user_prompt(T: int, C: int) -> str:
     return (
         f"You are an autonomous drone navigation assistant. "
-        f"You are given {T} consecutive aerial frames.\n\n"
-        "Analyze object positions and motion across frames, then predict the next "
-        f"{C} drone actions.\n\n"
-        "Output EXACTLY:\n"
+        f"Analyze this mosaic containing {T} consecutive aerial frames. "
+        f"Predict the next {C} actions.\n\n"
+        "Output EXACTLY in this format:\n"
         + "\n".join(f"Action_{i}: <0-7>  Halt_{i}: <1-6>" for i in range(C))
-        + "\n\nAction index: 0=north 1=south 2=east 3=west 4=up 5=down 6=yaw_right 7=yaw_left"
     )
-
 
 # ---------------------------------------------------------------------------
 # Config
@@ -68,7 +55,7 @@ class AuAirTeacherConfig:
     temporal_window: int = 4
     action_chunk_size: int = 4
     eval_ratio: float = 0.1
-    task_count: int = 25000        # max train samples (capped to dataset size)
+    task_count: int = 25000
     eval_task_count: int = 1000
     batch_size: int = 4
     gradient_accumulation_steps: int = 4
@@ -78,23 +65,14 @@ class AuAirTeacherConfig:
     lora_alpha: int = 32
     seed: int = 7
     output_dir: str = "artifacts/teacher_lora/gemma_e4b_auair"
-    max_length: int = 512          # text tokens (image tokens added on top)
+    max_length: int = 1024
     log_sample_every: int = 100
-
 
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
 
 class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
-    """
-    Loads AU-AIR sequences from parse_auair.py output.
-    Labels = GT telemetry action_indices + halt_steps (no model annotation).
-
-    Supervised target: structured action chunk only (no CoT).
-    Short target → fits more samples in context, cleaner gradient signal.
-    """
-
     def __init__(
         self,
         jsonl_path: Path,
@@ -108,13 +86,7 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
         self.T = temporal_window
         self.C = action_chunk_size
         self.images_path = Path(images_path) if images_path else None
-
-        image_seq_length = getattr(processor, "image_seq_length", 280)
-        try:
-            self.image_seq_length = int(image_seq_length)
-        except (TypeError, ValueError):
-            self.image_seq_length = 280
-        self.max_length = max_length + self.T * self.image_seq_length
+        self.max_length = max_length
 
         self.records: list[dict] = []
         with open(jsonl_path, encoding="utf-8") as f:
@@ -127,40 +99,22 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
     def __len__(self) -> int:
         return len(self.records)
 
-    def _supports_chat_template(self) -> bool:
-        return bool(
-            getattr(self.processor, "chat_template", None)
-            or getattr(getattr(self.processor, "tokenizer", None), "chat_template", None)
-        )
-
     @staticmethod
     def _make_mosaic(images: list[Image.Image]) -> Image.Image:
-        """Compose T frames into a 2×2 (or 1×T) mosaic as a single image.
-
-        Workaround for transformers 5.5.0 bug: Gemma4's _position_embeddings
-        expects 4D pixel_values but gets 5D when T>1 images are passed separately.
-        Passing a single mosaic image avoids the multi-image code path entirely.
-        """
         T = len(images)
-        w, h = images[0].size
-        if T == 1:
-            return images[0]
-        if T <= 2:
-            mosaic = Image.new("RGB", (w * T, h))
-            for i, img in enumerate(images):
-                mosaic.paste(img.resize((w, h)), (i * w, 0))
-        else:
-            # 2×2 grid (pad with last frame if T<4)
-            imgs = (images + [images[-1]] * 4)[:4]
-            mosaic = Image.new("RGB", (w * 2, h * 2))
-            for i, img in enumerate(imgs):
-                mosaic.paste(img.resize((w, h)), ((i % 2) * w, (i // 2) * h))
+        res = 224
+        imgs = [img.resize((res, res), Image.Resampling.LANCZOS) for img in images]
+        if T == 1: return imgs[0]
+        mosaic = Image.new("RGB", (res * 2, res * 2))
+        for i in range(min(4, T)):
+            mosaic.paste(imgs[i], ((i % 2) * res, (i // 2) * res))
+        if T < 4:
+            for i in range(T, 4):
+                mosaic.paste(imgs[-1], ((i % 2) * res, (i // 2) * res))
         return mosaic
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         record = self.records[index]
-
-        # Load T frames
         image_paths = record.get("image_paths", [])
         if len(image_paths) < self.T:
             image_paths = [image_paths[0]] * (self.T - len(image_paths)) + image_paths
@@ -168,71 +122,42 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
 
         images = []
         for p in image_paths:
-            if self.images_path:
-                # Resolve relative to provided images root
-                resolved_path = self.images_path / Path(p).name
-            else:
-                resolved_path = Path(p)
-                
+            resolved_path = self.images_path / Path(p).name if self.images_path else Path(p)
             if not resolved_path.exists():
-                raise FileNotFoundError(f"Image not found: {resolved_path} (original path: {p})")
-            
+                raise FileNotFoundError(f"Image not found: {resolved_path}")
             images.append(Image.open(resolved_path).convert("RGB"))
 
-        # Compose T frames into single mosaic (avoids transformers 5.5.0 5D pixel_values bug)
         mosaic = self._make_mosaic(images)
 
-        # GT labels from telemetry
-        action_indices = record.get("action_indices", [record.get("action_index", 0)] * self.C)
-        halt_steps = record.get("halt_steps", [record.get("halt_step", 3)] * self.C)
-        action_indices = (list(action_indices) * self.C)[: self.C]
-        halt_steps = (list(halt_steps) * self.C)[: self.C]
+        action_indices_raw = record.get("action_indices", [record.get("action_index", 0)] * self.C)
+        halt_steps_raw = record.get("halt_steps", [record.get("halt_step", 3)] * self.C)
+        action_indices = (list(action_indices_raw) * self.C)[: self.C]
+        halt_steps = (list(halt_steps_raw) * self.C)[: self.C]
 
-        answer = "\n".join(
-            f"Action_{i}: {action_indices[i]}  Halt_{i}: {halt_steps[i]}"
-            for i in range(self.C)
-        )
-
+        answer = "\n".join(f"Action_{i}: {action_indices[i]}  Halt_{i}: {halt_steps[i]}" for i in range(self.C))
         user_prompt = _user_prompt(self.T, self.C)
 
-        if self._supports_chat_template():
-            # Single image token for the mosaic
-            content: list[dict] = [{"type": "image"}, {"type": "text", "text": user_prompt}]
-            messages = [{"role": "user", "content": content}]
-            prompt = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-        else:
-            prompt = "<image_0>\n" + user_prompt + "\n"
+        # Standard conversation format for Unsloth
+        messages = [
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_prompt}]},
+            {"role": "assistant", "content": [{"type": "text", "text": answer}]}
+        ]
+        
+        prompt = self.processor.apply_chat_template(messages[:1], tokenize=False, add_generation_prompt=True)
+        full_text = self.processor.apply_chat_template(messages, tokenize=False)
 
-        full_text = prompt + answer + self.processor.tokenizer.eos_token
-
-        inputs = self.processor(
-            text=full_text,
-            images=mosaic,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=self.max_length,
-            truncation=True,
-        )
+        inputs = self.processor(text=full_text, images=mosaic, return_tensors="pt", padding="max_length", max_length=self.max_length, truncation=True)
         payload = {k: v.squeeze(0) for k, v in inputs.items()}
 
-        # Mask prompt — supervise answer only
-        prompt_tokens = self.processor(
-            text=prompt,
-            images=mosaic,
-            return_tensors="pt",
-            truncation=True,
-            max_length=self.max_length,
-        ).input_ids.squeeze(0)
+        prompt_inputs = self.processor(text=prompt, images=mosaic, return_tensors="pt", truncation=True, max_length=self.max_length)
+        prompt_len = prompt_inputs.input_ids.shape[1]
 
         labels = payload["input_ids"].clone()
-        labels[: len(prompt_tokens)] = -100
+        labels[:prompt_len] = -100
         labels[payload["attention_mask"] == 0] = -100
         payload["labels"] = labels
 
         return payload
-
 
 # ---------------------------------------------------------------------------
 # Metrics
@@ -241,14 +166,12 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
 def _parse_chunk(text: str, C: int) -> tuple[list[int] | None, list[int] | None]:
     actions, halts = [], []
     for i in range(C):
-        am = re.search(rf"Action_{i}:\s*(\d+)", text)
-        hm = re.search(rf"Halt_{i}:\s*(\d+)", text)
-        if not am or not hm:
-            return None, None
+        am = re.search(rf"Action[_\s:]*{i}\s*[:\s-]*\s*(\d+)", text, re.IGNORECASE)
+        hm = re.search(rf"Halt[_\s:]*{i}\s*[:\s-]*\s*(\d+)", text, re.IGNORECASE)
+        if not am or not hm: return None, None
         actions.append(int(am.group(1)))
         halts.append(int(hm.group(1)))
     return actions, halts
-
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -260,249 +183,113 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     device = select_device("cuda")
 
-    AutoModelForImageTextToText, AutoProcessor, _ = _lazy_import_transformers()
-    from peft import LoraConfig, get_peft_model
-    from transformers import get_cosine_schedule_with_warmup
+    from unsloth import FastVisionModel
+    import torch
 
-    logger.info("--- AU-AIR Teacher Fine-tuning (GT telemetry labels) ---")
-    logger.info("Model:  %s", config.foundation_model_id)
-    logger.info("Data:   %s", config.auair_path)
-    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
-    logger.info("Device: %s (%s)", device, gpu_name)
+    logger.info("--- AU-AIR Teacher Fine-tuning (Unsloth Speedup) ---")
+    
+    # 1. Load Model
+    model, processor = FastVisionModel.from_pretrained(
+        model_name = config.foundation_model_id,
+        load_in_4bit = True,
+        use_gradient_checkpointing = "unsloth",
+    )
 
-    # ── Load all records and split ──────────────────────────────────────────
-    all_lines: list[str] = []
+    # 2. Add LoRA
+    model = FastVisionModel.get_peft_model(
+        model,
+        r = config.lora_r,
+        target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_alpha = config.lora_alpha,
+        lora_dropout = 0,
+        bias = "none",
+        random_state = config.seed,
+        finetune_vision_layers = False,
+    )
+
+    # ── Split Data ──────────────────────────────────────────────────────────
+    all_lines = []
     with open(config.auair_path, encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if line:
-                all_lines.append(line)
+            if line.strip(): all_lines.append(line)
 
     rng = np.random.default_rng(config.seed)
     idx = rng.permutation(len(all_lines))
     eval_n = min(config.eval_task_count, max(1, int(len(all_lines) * config.eval_ratio)))
     train_n = min(config.task_count, len(all_lines) - eval_n)
-    logger.info("Dataset split — train: %d  eval: %d  (total available: %d)", train_n, eval_n, len(all_lines))
-
+    
     import tempfile
     tmp = Path(tempfile.mkdtemp())
     (tmp / "train.jsonl").write_text("\n".join(all_lines[i] for i in idx[:train_n]))
     (tmp / "eval.jsonl").write_text("\n".join(all_lines[i] for i in idx[train_n: train_n + eval_n]))
 
-    # ── Model ───────────────────────────────────────────────────────────────
-    logger.info("Loading processor for %s...", config.foundation_model_id)
-    t_load = time.time()
-    processor = AutoProcessor.from_pretrained(config.foundation_model_id, trust_remote_code=True)
-
-    # Workaround: transformers 5.5.0 bitsandbytes set_submodule bug with Gemma4
-    import torch.nn as _nn
-    if not hasattr(_nn.Module, 'set_submodule'):
-        def _set_submodule(self, target: str, module: _nn.Module) -> None:
-            atoms = target.split('.')
-            mod: _nn.Module = self
-            for item in atoms[:-1]:
-                mod = mod.get_submodule(item)
-            setattr(mod, atoms[-1], module)
-        _nn.Module.set_submodule = _set_submodule
-
-    logger.info("Loading model in native bfloat16 (full precision vision)...")
-    model = AutoModelForImageTextToText.from_pretrained(
-        config.foundation_model_id,
-        device_map={"": 0},
-        dtype=torch.bfloat16,
-        attn_implementation="sdpa",
-        trust_remote_code=True,
-    )
-    model.gradient_checkpointing_enable()
-
-    for param in model.parameters():
-        param.requires_grad = False
-
-    lora_config = LoraConfig(
-        r=config.lora_r,
-        lora_alpha=config.lora_alpha,
-        target_modules="all-linear",
-        bias="none",
-        task_type="CAUSAL_LM",
-    )
-    model = get_peft_model(model, lora_config)
-    for name, param in model.named_parameters():
-        if "lora" in name:
-            param.data = param.data.to(torch.bfloat16)
-    model.print_trainable_parameters()
-    logger.info("Model loaded in %.1fs", time.time() - t_load)
-
-    # ── Datasets ────────────────────────────────────────────────────────────
-    train_ds = AuAirTeacherDataset(
-        tmp / "train.jsonl", processor, config.max_length,
-        temporal_window=config.temporal_window,
-        action_chunk_size=config.action_chunk_size,
-    )
-    eval_ds = AuAirTeacherDataset(
-        tmp / "eval.jsonl", processor, config.max_length,
-        temporal_window=config.temporal_window,
-        action_chunk_size=config.action_chunk_size,
-    )
+    train_ds = AuAirTeacherDataset(tmp / "train.jsonl", processor, config.max_length, config.temporal_window, config.action_chunk_size, config.auair_images_path)
+    eval_ds = AuAirTeacherDataset(tmp / "eval.jsonl", processor, config.max_length, config.temporal_window, config.action_chunk_size, config.auair_images_path)
+    
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True)
     eval_loader = DataLoader(eval_ds, batch_size=config.batch_size, shuffle=False)
 
-    # ── Optimizer ───────────────────────────────────────────────────────────
-    try:
-        import bitsandbytes as bnb_opt
-        optimizer = bnb_opt.optim.AdamW8bit(model.parameters(), lr=config.learning_rate)
-        logger.info("Optimizer: AdamW 8-bit  lr=%.2e", config.learning_rate)
-    except ImportError:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-        logger.warning("bitsandbytes not available — falling back to standard AdamW  lr=%.2e", config.learning_rate)
-
+    # 3. Training
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    from transformers import get_cosine_schedule_with_warmup
     total_steps = (len(train_loader) // config.gradient_accumulation_steps) * config.epochs
-    warmup_steps = max(1, int(total_steps * 0.05))
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps
-    )
+    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=int(total_steps * 0.05), num_training_steps=total_steps)
 
-    # ── Training ────────────────────────────────────────────────────────────
-    logger.info("Starting training — %d epochs, %d steps/epoch, warmup=%d", config.epochs, len(train_loader) // config.gradient_accumulation_steps, warmup_steps)
+    logger.info("Starting training...")
     best_eval_loss = float("inf")
-    epoch_history: list[dict] = []
+    epoch_history = []
     C = config.action_chunk_size
 
     for epoch in range(1, config.epochs + 1):
-        logger.info("Epoch %d/%d starting...", epoch, config.epochs)
-        t_epoch = time.time()
         model.train()
         total_train_loss = 0.0
         correct_actions = 0
         total_processed = 0
-        optimizer.zero_grad()
-
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs} [Train]")
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{config.epochs}")
         for batch_idx, batch in enumerate(pbar):
             batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-            if "pixel_values" in batch:
-                batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
-
-            outputs = model(**batch, return_dict=True)
+            outputs = model(**batch)
             loss = outputs.loss / config.gradient_accumulation_steps
             loss.backward()
 
-            if (batch_idx + 1) % config.gradient_accumulation_steps == 0 or (batch_idx + 1) == len(train_loader):
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
 
-            total_train_loss += loss.item() * config.gradient_accumulation_steps
-
-            # Sample metrics (first item in batch)
+            total_train_loss += outputs.loss.item()
+            
+            # Sample accuracy on Action_0
             with torch.no_grad():
                 logits = outputs.logits[0]
-                labels_i = batch["labels"][0]
-                sl, sl2 = logits[:-1], labels_i[1:]
-                vmask = sl2 != -100
+                labels = batch["labels"][0]
+                vmask = labels != -100
                 if vmask.any():
-                    pred_ids = torch.argmax(sl, dim=-1)[vmask]
-                    true_ids = sl2[vmask]
-                    pred_text = processor.tokenizer.decode(pred_ids, skip_special_tokens=True)
-                    true_text = processor.tokenizer.decode(true_ids, skip_special_tokens=True)
+                    pred_text = processor.tokenizer.decode(torch.argmax(logits[:-1], dim=-1)[vmask[1:]], skip_special_tokens=True)
+                    true_text = processor.tokenizer.decode(labels[vmask], skip_special_tokens=True)
                     pa, _ = _parse_chunk(pred_text, C)
                     ta, _ = _parse_chunk(true_text, C)
-                    if pa is not None and ta is not None and pa[0] == ta[0]:
-                        correct_actions += 1
+                    if pa and ta and pa[0] == ta[0]: correct_actions += 1
                     total_processed += 1
 
-                    if batch_idx % config.log_sample_every == 0:
-                        logger.debug(
-                            "[B%d] loss=%.4f  lr=%.2e",
-                            batch_idx,
-                            loss.item() * config.gradient_accumulation_steps,
-                            scheduler.get_last_lr()[0],
-                        )
-                        logger.debug("  GT:   %s", true_text.strip()[:120])
-                        logger.debug("  Pred: %s", pred_text.strip()[:120])
+            pbar.set_postfix({"loss": f"{outputs.loss.item():.4f}", "acc": f"{correct_actions/max(total_processed,1)*100:.1f}%"})
 
-            pbar.set_postfix({"loss": f"{loss.item()*config.gradient_accumulation_steps:.4f}",
-                              "act0_acc": f"{correct_actions/max(total_processed,1)*100:.1f}%"})
-
-        avg_train_loss = total_train_loss / len(train_loader)
-        train_act_acc = correct_actions / max(total_processed, 1) * 100
-
-        # ── Eval ────────────────────────────────────────────────────────────
+        # Eval
         model.eval()
         total_eval_loss = 0.0
-        eval_correct = [0] * C
-        eval_parseable = 0
-        eval_total = 0
-
         with torch.no_grad():
-            for batch in tqdm(eval_loader, desc=f"Epoch {epoch}/{config.epochs} [Eval]"):
+            for batch in eval_loader:
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
-                if "pixel_values" in batch:
-                    batch["pixel_values"] = batch["pixel_values"].to(dtype=torch.bfloat16)
-                outputs = model(**batch, return_dict=True)
+                outputs = model(**batch)
                 total_eval_loss += outputs.loss.item()
-
-                for i in range(batch["labels"].shape[0]):
-                    sl = outputs.logits[i][:-1]
-                    sl2 = batch["labels"][i][1:]
-                    vmask = sl2 != -100
-                    if not vmask.any():
-                        continue
-                    pred_text = processor.tokenizer.decode(torch.argmax(sl, dim=-1)[vmask], skip_special_tokens=True)
-                    true_text = processor.tokenizer.decode(sl2[vmask], skip_special_tokens=True)
-                    pa, _ = _parse_chunk(pred_text, C)
-                    ta, _ = _parse_chunk(true_text, C)
-                    if pa is not None:
-                        eval_parseable += 1
-                    if pa is not None and ta is not None:
-                        for c in range(C):
-                            if pa[c] == ta[c]:
-                                eval_correct[c] += 1
-                    eval_total += 1
-
-        avg_eval_loss = total_eval_loss / max(len(eval_loader), 1)
-        eval_parse_rate = eval_parseable / max(eval_total, 1) * 100
-        chunk_acc = [eval_correct[c] / max(eval_parseable, 1) * 100 for c in range(C)]
-
-        t_epoch_elapsed = time.time() - t_epoch
-        chunk_acc_str = "  ".join(f"a{c}={chunk_acc[c]:.1f}%" for c in range(C))
-        logger.info(
-            "Epoch %d/%d done in %.1fs | train_loss=%.4f  eval_loss=%.4f  "
-            "train_act0=%.1f%%  eval_parse=%.1f%%  eval_chunk=[%s]",
-            epoch, config.epochs, t_epoch_elapsed,
-            avg_train_loss, avg_eval_loss,
-            train_act_acc, eval_parse_rate,
-            chunk_acc_str,
-        )
-
-        epoch_metrics = {
-            "epoch": epoch,
-            "train_loss": round(avg_train_loss, 4),
-            "eval_loss": round(avg_eval_loss, 4),
-            "train_action0_acc": round(train_act_acc, 2),
-            "eval_parse_rate": round(eval_parse_rate, 2),
-            "eval_samples": eval_total,
-            "eval_chunk_acc": [round(v, 2) for v in chunk_acc],
-        }
-        epoch_history.append(epoch_metrics)
-
+        
+        avg_eval_loss = total_eval_loss / len(eval_loader)
+        logger.info("Epoch %d: eval_loss=%.4f", epoch, avg_eval_loss)
+        
         if avg_eval_loss < best_eval_loss:
             best_eval_loss = avg_eval_loss
-            logger.info("New best eval loss %.4f — saving adapters to %s", best_eval_loss, output_dir)
             model.save_pretrained(output_dir)
             processor.save_pretrained(output_dir)
 
-    summary = {
-        "foundation_model_id": config.foundation_model_id,
-        "output_dir": output_dir.as_posix(),
-        "auair_path": config.auair_path,
-        "train_count": train_n,
-        "eval_count": eval_n,
-        "temporal_window": config.temporal_window,
-        "action_chunk_size": config.action_chunk_size,
-        "epochs": config.epochs,
-        "best_eval_loss": best_eval_loss,
-        "epoch_history": epoch_history,
-    }
-    (output_dir / "finetune_summary.json").write_text(json.dumps(summary, indent=2))
-    return summary
+    return {"best_eval_loss": best_eval_loss, "output_dir": str(output_dir)}
