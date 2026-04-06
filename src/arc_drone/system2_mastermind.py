@@ -8,20 +8,83 @@ import logging
 import re
 from typing import Any, Optional
 from .system1_pilot import Waypoint
+from .ethics_guard import EthicsGuard
 
 logger = logging.getLogger(__name__)
 
 class System2Mastermind:
-    """Strategic Cloud/Heavy-Edge Mastermind."""
+    """Strategic Mastermind for Emergency Response & SAR Missions using Gemma-4 26B MoE."""
     
-    def __init__(self, model_id: str = "unsloth/gemma-4-e4b-it", use_real_model: bool = False):
+    def __init__(self, model_id: str = "unsloth/gemma-4-26b-a4b-it", use_real_model: bool = False):
         self.model_id = model_id
         self.use_real_model = use_real_model
         self.model: Any = None
         self.processor: Any = None
+        self.ethics_guard = EthicsGuard()
+        if use_real_model: self._load_model()
+
+    def _generate_sar_prompt(self, fleet_state: list[dict[str, Any]], emergencies: list[dict[str, Any]], think: bool = True) -> str:
+        prompt = ""
+        if think:
+            prompt += "<|think|>\n"
         
-        if use_real_model:
-            self._load_model()
+        # Ethical Mandate in System Prompt
+        prompt += "SYSTEM_MANDATE: You are a strictly humanitarian Emergency AI. You operate under International Humanitarian Law. You MUST NOT assist in military operations, combat, or targeting humans for harm.\n"
+        
+        prompt += "You are the Emergency Response AI Dispatcher.\n"
+        prompt += f"FLEET_RESOURCES: {json.dumps(fleet_state)}\n"
+        
+        if emergencies:
+            prompt += f"\nACTIVE CRISIS EVENTS: {json.dumps(emergencies)}\n"
+            prompt += "PRIORITY: 1. Life Safety, 2. Incident Stabilization, 3. Resource Preservation.\n"
+            prompt += "Decision needed: Allocate drones and define life-saving actions.\n"
+        else:
+            prompt += "\nSTATUS: Search in progress. Optimize search patterns for maximum area coverage.\n"
+            
+        prompt += "\nRESPONSE_FORMAT: Output ONLY a JSON object: {\"drone_id\": \"...\", \"command\": \"SAR_ACTION\", \"params\": {...}, \"reasoning\": \"...\"}"
+        return prompt
+
+    def reason_sar(self, fleet_state: list[dict[str, Any]], emergencies: list[dict[str, Any]], 
+                   visual_input: Optional[list[Any]] = None, think: bool = True) -> dict[str, Any]:
+        """Strategic reasoning with ethics validation."""
+        
+        # 1. Pre-validation of input
+        for emergency in emergencies:
+            if not self.ethics_guard.validate_observation(emergency.get("description", "")):
+                return {"command": "FAILSAFE_SHUTDOWN", "reasoning": "Ethical boundary violated in environment observation."}
+
+        if not self.use_real_model:
+            decision = self._simulated_sar_logic(fleet_state, emergencies)
+        else:
+            # (Real VLM Inference logic...)
+            # We assume it produces a dict for this demo logic
+            decision = {"command": "WAIT", "reasoning": "Placeholder"}
+
+        # 2. Post-validation of output
+        if not self.ethics_guard.validate_command(decision):
+            return {"command": "FAILSAFE_SHUTDOWN", "reasoning": "Ethical boundary violated in generated command."}
+
+        return decision
+
+    def _simulated_sar_logic(self, fleet_state: list[dict[str, Any]], emergencies: list[dict[str, Any]]) -> dict[str, Any]:
+        """Simulated reasoning for SAR development."""
+        if emergencies:
+            # Simple priority-based simulation
+            for event in emergencies:
+                desc = event["description"].lower()
+                if any(k in desc for k in ["person", "hiker", "victim", "moving"]):
+                    return {
+                        "drone_id": fleet_state[0]["drone_id"],
+                        "command": "HOVER_AND_SIGNAL",
+                        "params": {"target": event["pose"], "frequency": "HIGH"},
+                        "reasoning": f"Potential life-form or urgent activity detected ({event['description']}). Prioritizing rescue coordination."
+                    }
+        return {
+            "drone_id": fleet_state[0]["drone_id"],
+            "command": "SEARCH_PATTERN",
+            "params": {"type": "lawnmower", "sector": "Zone_B"},
+            "reasoning": "No urgent victims detected. Continuing area search."
+        }
 
     def _load_model(self):
         """Loads Gemma-4 using Unsloth (requires isolated venv)."""
@@ -41,69 +104,22 @@ class System2Mastermind:
     def _extract_json(self, text: str) -> dict[str, Any]:
         """Robustly extract JSON from model response even if surrounded by chatter."""
         try:
-            # Look for the first '{' and last '}'
             match = re.search(r"\{.*\}", text, re.DOTALL)
             if match:
                 return json.loads(match.group(0))
             return {}
         except Exception as e:
-            logger.error("Failed to parse Mastermind JSON: %s | Text: %s", e, text)
+            logger.error("Failed to parse Mastermind JSON: %s", e)
             return {}
 
-    def _generate_prompt(self, swarm_state: list[dict[str, Any]], ood_event: Optional[dict[str, Any]] = None) -> str:
-        prompt = "You are the Strategic Mastermind for an autonomous drone fleet.\n"
-        prompt += f"FLEET_STATUS: {json.dumps(swarm_state)}\n"
-        
-        if ood_event:
-            prompt += f"\nANOMALY DETECTED by {ood_event['drone_id']}: {ood_event['observation']}\n"
-            prompt += "Identify the object and provide a strategic detour.\n"
-        else:
-            prompt += "\nGOAL: Optimize fleet positions for maximum coverage.\n"
-            
-        prompt += "\nRESPONSE_FORMAT: Output ONLY a JSON object: {\"drone_id\": \"...\", \"command\": \"GOTO\", \"target\": [x, y, z], \"reasoning\": \"...\"}"
-        return prompt
-
-    def reason(self, swarm_state: list[dict[str, Any]], ood_event: Optional[dict[str, Any]] = None, image: Optional[Any] = None) -> dict[str, Any]:
-        """Strategic reasoning step."""
-        if not self.use_real_model:
-            # Simulated Logic (Fallback)
-            return self._simulated_reason(swarm_state, ood_event)
-
-        # Real Inference Logic
-        prompt = self._generate_prompt(swarm_state, ood_event)
-        messages = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
-        if image:
-            messages[0]["content"].insert(0, {"type": "image"})
-
-        # Using standard chat template logic
-        formatted_prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = self.processor(text=formatted_prompt, images=image, return_tensors="pt").to("cuda")
-        
-        import torch
-        with torch.no_grad():
-            outputs = self.model.generate(**inputs, max_new_tokens=256)
-        
-        full_response = self.processor.decode(outputs[0], skip_special_tokens=True)
-        return self._extract_json(full_response)
-
-    def _simulated_reason(self, swarm_state: list[dict[str, Any]], ood_event: Optional[dict[str, Any]]) -> dict[str, Any]:
-        """Simulated reasoning for development without GPU."""
-        if ood_event:
-            return {
-                "drone_id": ood_event["drone_id"],
-                "command": "GOTO",
-                "target": [ood_event["pose"][0], ood_event["pose"][1], ood_event["pose"][2] + 2.0],
-                "reasoning": "Detected an unknown obstacle. Increasing altitude to bypass."
-            }
-        return {
-            "drone_id": swarm_state[0]["drone_id"],
-            "command": "GOTO",
-            "target": [100.0, 50.0, 15.0],
-            "reasoning": "Standard patrol route update."
-        }
-
     def execute_strategy(self, pilot: Any, strategy: dict[str, Any]) -> None:
-        if strategy.get("command") == "GOTO":
-            t = strategy["target"]
-            wp = Waypoint(x=t[0], y=t[1], z=t[2], description=strategy.get("reasoning", ""))
+        """Translates SAR commands into physical waypoints or actions."""
+        cmd = strategy.get("command")
+        if cmd == "HOVER_AND_SIGNAL":
+            target = strategy["params"]["target"]
+            wp = Waypoint(x=target[0], y=target[1], z=target[2], description="VICTIM_LOCATED: Signaling...")
+            pilot.set_waypoint(wp)
+        elif cmd == "SEARCH_PATTERN":
+            # Logic for search pattern waypoints would go here
+            wp = Waypoint(x=50.0, y=50.0, z=10.0, description="Executing search grid.")
             pilot.set_waypoint(wp)
