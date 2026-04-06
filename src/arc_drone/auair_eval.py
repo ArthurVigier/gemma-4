@@ -111,6 +111,30 @@ def _load_sequences(jsonl_path: Path, max_samples: int, seed: int = 42) -> list[
     return selected
 
 
+def _make_mosaic(images: list[Image.Image]) -> Image.Image:
+    """Compose T frames into a 2×2 mosaic, resizing them to 224x224 each."""
+    T = len(images)
+    res = 224 # Native resolution for many vision towers
+    if T == 0:
+        return Image.new("RGB", (res * 2, res * 2), color=(80, 80, 80))
+    
+    imgs = [img.resize((res, res), Image.Resampling.LANCZOS) for img in images]
+    
+    if T == 1:
+        return imgs[0]
+    
+    # Always produce a 2x2 grid for consistency
+    mosaic = Image.new("RGB", (res * 2, res * 2))
+    for i in range(min(4, T)):
+        mosaic.paste(imgs[i], ((i % 2) * res, (i // 2) * res))
+    
+    if T < 4:
+        for i in range(T, 4):
+            mosaic.paste(imgs[-1], ((i % 2) * res, (i // 2) * res))
+            
+    return mosaic
+
+
 def _load_images(image_paths: list[str], T: int, images_path: str | None = None) -> list[Image.Image]:
     if len(image_paths) < T:
         image_paths = [image_paths[0]] * (T - len(image_paths)) + image_paths
@@ -135,8 +159,6 @@ def _load_images(image_paths: list[str], T: int, images_path: str | None = None)
             raise FileNotFoundError(f"Image not found: {resolved}")
             
         img = Image.open(resolved).convert("RGB")
-        # Standardize size for the vision tower
-        img = img.resize((224, 224), Image.Resampling.LANCZOS)
         images.append(img)
             
     return images
@@ -145,8 +167,8 @@ def _load_images(image_paths: list[str], T: int, images_path: str | None = None)
 def _user_prompt(T: int, C: int) -> str:
     return (
         f"You are an autonomous drone navigation assistant. "
-        f"Predict the next {C} actions based on these frames.\n\n"
-        "Output EXACTLY in this format:\n"
+        f"Analyze this mosaic containing {T} consecutive aerial frames (ordered top-left, top-right, bottom-left, bottom-right). "
+        f"Predict the next {C} actions.\n\nOutput EXACTLY in this format:\n"
         + "\n".join(f"Action_{i}: <0-7>  Halt_{i}: <1-6>" for i in range(C))
     )
 
@@ -204,22 +226,27 @@ def evaluate_gemma(
 
     for idx, seq in enumerate(sequences):
         raw_images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
+        mosaic = _make_mosaic(raw_images)
         
-        # Debug: Save first image of the first sequence to verify loading
+        # FIX: Define labels inside the loop
+        gt_actions_raw = seq.get("action_indices", [seq.get("action_index", 0)] * C)
+        gt_halts_raw = seq.get("halt_steps", [seq.get("halt_step", 3)] * C)
+        gt_actions = (list(gt_actions_raw) * C)[:C]
+        gt_halts = (list(gt_halts_raw) * C)[:C]
+
         if total == 0:
             debug_path = Path("logs/debug_input.jpg")
             debug_path.parent.mkdir(exist_ok=True)
-            raw_images[-1].save(debug_path)
-            logger.info("[%s] Saved debug image to %s", name, debug_path)
+            mosaic.save(debug_path)
+            logger.info("[%s] Saved mosaic debug image to %s", name, debug_path)
 
-        # Build content: T images THEN text
-        content = [{"type": "image"} for _ in range(T)]
-        content.append({"type": "text", "text": prompt_tmpl})
+        # Single image (mosaic) input
+        content = [{"type": "image"}, {"type": "text", "text": prompt_tmpl}]
         messages = [{"role": "user", "content": content}]
 
         try:
             prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = processor(text=prompt, images=raw_images, return_tensors="pt").to(model.device)
+            inputs = processor(text=prompt, images=mosaic, return_tensors="pt").to(model.device)
             
             if total == 0:
                 pv = inputs.get("pixel_values")
@@ -246,7 +273,8 @@ def evaluate_gemma(
                 parseable += 1
                 for c in range(C):
                     if pa[c] == gt_actions[c]: correct_actions[c] += 1
-                if ph is not None and ph[0] == gt_halts[0]: correct_halts += 1
+                if ph is not None and ph[0] == gt_halts[0]:
+                    correct_halts += 1
         except Exception as e:
             logger.error("[%s] sample %s failed: %s", name, seq.get("sample_id"), e)
 
@@ -317,8 +345,11 @@ def evaluate_trm(
     tmp.unlink(missing_ok=True)
 
     for i, seq in enumerate(sequences):
-        gt_actions = (list(seq.get("action_indices", [seq.get("action_index", 0)] * C)) * C)[:C]
-        gt_halts = (list(seq.get("halt_steps", [seq.get("halt_step", 3)] * C)) * C)[:C]
+        gt_actions_raw = seq.get("action_indices", [seq.get("action_index", 0)] * C)
+        gt_halts_raw = seq.get("halt_steps", [seq.get("halt_step", 3)] * C)
+        gt_actions = (list(gt_actions_raw) * C)[:C]
+        gt_halts = (list(gt_halts_raw) * C)[:C]
+        
         item = ds[i]
         grids = item["grids"].unsqueeze(0).to(dev)
         t0 = time.perf_counter()
@@ -425,15 +456,19 @@ def adapt_and_evaluate_gemma(
 
     for seq in eval_sequences:
         raw_images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
-        gt_actions = (list(seq.get("action_indices", [seq.get("action_index", 0)] * C)) * C)[:C]
-        gt_halts = (list(seq.get("halt_steps", [seq.get("halt_step", 3)] * C)) * C)[:C]
-        content = [{"type": "image"} for _ in range(T)]
-        content.append({"type": "text", "text": prompt_tmpl})
+        mosaic = _make_mosaic(raw_images)
+        
+        gt_actions_raw = seq.get("action_indices", [seq.get("action_index", 0)] * C)
+        gt_halts_raw = seq.get("halt_steps", [seq.get("halt_step", 3)] * C)
+        gt_actions = (list(gt_actions_raw) * C)[:C]
+        gt_halts = (list(gt_halts_raw) * C)[:C]
+        
+        content = [{"type": "image"}, {"type": "text", "text": prompt_tmpl}]
         messages = [{"role": "user", "content": content}]
 
         try:
             prompt = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            inputs = processor(text=prompt, images=raw_images, return_tensors="pt").to(model.device)
+            inputs = processor(text=prompt, images=mosaic, return_tensors="pt").to(model.device)
             t0 = time.perf_counter()
             with torch.no_grad():
                 out_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id)
