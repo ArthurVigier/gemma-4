@@ -347,6 +347,18 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
         logger.info("Eval teacher features built in %.1fs", time.perf_counter() - t0)
         train_action_indices = torch.stack([train_base[index]["action_indices"][0] for index in range(len(train_base))])
         train_halt_steps = torch.stack([train_base[index]["halt_step"] for index in range(len(train_base))])
+
+    combined_train_features = _combine_teacher_features(
+        features_by_layer=train_features_by_layer,
+        layer_indices=layer_indices,
+        pooling=config.teacher_feature_pooling,
+    )
+    combined_eval_features = _combine_teacher_features(
+        features_by_layer=eval_features_by_layer,
+        layer_indices=layer_indices,
+        pooling=config.teacher_feature_pooling,
+    )
+
     logger.info("Fitting teacher probe (layers=%s, pooling=%s)...", list(layer_indices), config.teacher_feature_pooling)
     t0 = time.perf_counter()
     teacher_probe = _fit_teacher_probe(
