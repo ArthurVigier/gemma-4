@@ -58,6 +58,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--teacher-probe-batch-size", type=int, default=64)
     parser.add_argument("--teacher-temperature", type=float, default=2.0)
     parser.add_argument("--teacher-max-length", type=int, default=768)
+    parser.add_argument("--auair-path", default=None,
+                        help="Path to auair_sequences.jsonl. When set, distills from real AU-AIR "
+                             "frames via multimodal teacher instead of synthetic ARC tasks.")
     return parser.parse_args()
 
 
@@ -103,6 +106,7 @@ def main() -> int:
             teacher_probe_batch_size=args.teacher_probe_batch_size,
             teacher_temperature=args.teacher_temperature,
             teacher_max_length=args.teacher_max_length,
+            auair_path=args.auair_path,
         )
     )
     logger.info(

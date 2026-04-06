@@ -24,11 +24,12 @@ except Exception:  # pragma: no cover - optional dependency in lighter envs
 from .arc_drone_bench import ARCDroneBench
 from .config import BenchmarkConfig, DeploymentConfig, ReasonerConfig
 from .export_tensorrt import build_trtexec_command, export_reasoner_model_to_onnx
-from .gemma_layer_sweep import LayerProbe, build_teacher_features
+from .gemma_layer_sweep import LayerProbe, build_teacher_features, build_teacher_features_auair
 from .model import TRMReasoner
 from .stack_profiles import CURRENT_STACK_2026
 from .student_training import (
     ArcStudentDataset,
+    AuAirStudentDataset,
     StudentTrainingSummary,
     action_vocabulary_tensor,
     build_reasoner_config,
@@ -54,6 +55,10 @@ class DistillationCacheConfig:
     teacher_probe_learning_rate: float = 1e-3
     teacher_probe_batch_size: int = 64
     teacher_max_length: int = 768
+    # When set, use real AU-AIR sequences instead of synthetic ARC tasks
+    auair_path: str | None = None
+    teacher_lora_path: str | None = None
+    temporal_window: int = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +97,8 @@ class DistillationConfig:
     teacher_max_length: int = 768
     temporal_window: int = 4
     action_chunk_size: int = 4
+    # When set, build teacher cache from real AU-AIR sequences instead of synthetic ARC tasks
+    auair_path: str | None = None
 
 
 class CachedDistillationDataset(Dataset[dict[str, torch.Tensor]]):
@@ -259,46 +266,87 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
     layer_indices = _normalize_teacher_layer_indices(config.teacher_layer_indices)
     reasoner_config = ReasonerConfig(refinement_steps=config.refinement_steps)
 
-    train_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed)).generate_tasks()
-    eval_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1)).generate_tasks()
+    if config.auair_path is not None:
+        # --- Real AU-AIR sequences path ---
+        import json as _json
+        import random as _random
+        auair_records: list[dict] = []
+        with open(config.auair_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    auair_records.append(_json.loads(line))
+        _random.seed(config.seed)
+        _random.shuffle(auair_records)
+        n_train = min(config.task_count, int(len(auair_records) * 0.9))
+        n_eval = min(config.eval_task_count, len(auair_records) - n_train)
+        train_records = auair_records[:n_train]
+        eval_records = auair_records[n_train: n_train + n_eval]
+        logger.info("AU-AIR cache: %d train / %d eval sequences", len(train_records), len(eval_records))
 
-    train_base = ArcStudentDataset(train_tasks, reasoner_config)
-    eval_base = ArcStudentDataset(eval_tasks, reasoner_config)
+        train_base = AuAirStudentDataset(
+            Path(config.auair_path), reasoner_config,
+        )
+        train_base.records = train_records  # type: ignore[attr-defined]
+        eval_base = AuAirStudentDataset(
+            Path(config.auair_path), reasoner_config,
+        )
+        eval_base.records = eval_records  # type: ignore[attr-defined]
 
-    logger.info("Building teacher features for train split (%d tasks)...", len(train_tasks))
-    t0 = time.perf_counter()
-    train_features_by_layer, _, _, hidden_layer_count = build_teacher_features(
-        tasks=train_tasks,
-        foundation_model_id=config.foundation_model_id,
-        layers=list(layer_indices),
-        max_length=config.teacher_max_length,
-        device=device,
-    )
-    logger.info("Train teacher features built in %.1fs", time.perf_counter() - t0)
-    logger.info("Building teacher features for eval split (%d tasks)...", len(eval_tasks))
-    t0 = time.perf_counter()
-    eval_features_by_layer, _, _, _ = build_teacher_features(
-        tasks=eval_tasks,
-        foundation_model_id=config.foundation_model_id,
-        layers=list(layer_indices),
-        max_length=config.teacher_max_length,
-        device=device,
-    )
-    logger.info("Eval teacher features built in %.1fs", time.perf_counter() - t0)
+        logger.info("Building teacher features for train split (%d AU-AIR sequences)...", len(train_records))
+        t0 = time.perf_counter()
+        train_features_by_layer, train_action_indices, train_halt_steps, hidden_layer_count = build_teacher_features_auair(
+            records=train_records,
+            foundation_model_id=config.foundation_model_id,
+            lora_path=config.teacher_lora_path,
+            layers=list(layer_indices),
+            max_length=config.teacher_max_length,
+            temporal_window=config.temporal_window,
+            device=device,
+        )
+        logger.info("Train teacher features built in %.1fs", time.perf_counter() - t0)
+        logger.info("Building teacher features for eval split (%d AU-AIR sequences)...", len(eval_records))
+        t0 = time.perf_counter()
+        eval_features_by_layer, _, _, _ = build_teacher_features_auair(
+            records=eval_records,
+            foundation_model_id=config.foundation_model_id,
+            lora_path=config.teacher_lora_path,
+            layers=list(layer_indices),
+            max_length=config.teacher_max_length,
+            temporal_window=config.temporal_window,
+            device=device,
+        )
+        logger.info("Eval teacher features built in %.1fs", time.perf_counter() - t0)
+    else:
+        # --- Synthetic ARC tasks path (original) ---
+        train_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed)).generate_tasks()
+        eval_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1)).generate_tasks()
 
-    combined_train_features = _combine_teacher_features(
-        features_by_layer=train_features_by_layer,
-        layer_indices=layer_indices,
-        pooling=config.teacher_feature_pooling,
-    )
-    combined_eval_features = _combine_teacher_features(
-        features_by_layer=eval_features_by_layer,
-        layer_indices=layer_indices,
-        pooling=config.teacher_feature_pooling,
-    )
+        train_base = ArcStudentDataset(train_tasks, reasoner_config)
+        eval_base = ArcStudentDataset(eval_tasks, reasoner_config)
 
-    train_action_indices = torch.stack([train_base[index]["action_indices"][0] for index in range(len(train_base))])
-    train_halt_steps = torch.stack([train_base[index]["halt_step"] for index in range(len(train_base))])
+        logger.info("Building teacher features for train split (%d tasks)...", len(train_tasks))
+        t0 = time.perf_counter()
+        train_features_by_layer, _, _, hidden_layer_count = build_teacher_features(
+            tasks=train_tasks,
+            foundation_model_id=config.foundation_model_id,
+            layers=list(layer_indices),
+            max_length=config.teacher_max_length,
+            device=device,
+        )
+        logger.info("Train teacher features built in %.1fs", time.perf_counter() - t0)
+        logger.info("Building teacher features for eval split (%d tasks)...", len(eval_tasks))
+        t0 = time.perf_counter()
+        eval_features_by_layer, _, _, _ = build_teacher_features(
+            tasks=eval_tasks,
+            foundation_model_id=config.foundation_model_id,
+            layers=list(layer_indices),
+            max_length=config.teacher_max_length,
+            device=device,
+        )
+        logger.info("Eval teacher features built in %.1fs", time.perf_counter() - t0)
+        train_action_indices = torch.stack([train_base[index]["action_indices"][0] for index in range(len(train_base))])
+        train_halt_steps = torch.stack([train_base[index]["halt_step"] for index in range(len(train_base))])
     logger.info("Fitting teacher probe (layers=%s, pooling=%s)...", list(layer_indices), config.teacher_feature_pooling)
     t0 = time.perf_counter()
     teacher_probe = _fit_teacher_probe(
@@ -501,9 +549,11 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
 
     cache_dir = config.cache_dir
     if cache_dir is None:
-        # If a fine-tuned LoRA teacher is specified, monkey-patch _load_teacher_components
-        # so the cache is built from the fine-tuned model instead of vanilla Gemma.
-        if config.teacher_lora_path is not None:
+        # For the ARC (text-only) path, monkey-patch _load_teacher_components with LoRA.
+        # For the AU-AIR path, LoRA is handled directly in build_teacher_features_auair.
+        _gls = None
+        _orig_load = None
+        if config.teacher_lora_path is not None and config.auair_path is None:
             import arc_drone.gemma_layer_sweep as _gls
             _orig_load = _gls._load_teacher_components
 
@@ -518,7 +568,7 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
                 return tokenizer, model
 
             _gls._load_teacher_components = _lora_load_teacher
-            logger.info("Teacher cache will use fine-tuned LoRA: %s", config.teacher_lora_path)
+            logger.info("Teacher cache will use fine-tuned LoRA (ARC path): %s", config.teacher_lora_path)
 
         metadata = build_teacher_target_cache(
             DistillationCacheConfig(
@@ -535,11 +585,14 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
                 teacher_probe_learning_rate=config.teacher_probe_learning_rate,
                 teacher_probe_batch_size=config.teacher_probe_batch_size,
                 teacher_max_length=config.teacher_max_length,
+                auair_path=config.auair_path,
+                teacher_lora_path=config.teacher_lora_path,
+                temporal_window=config.temporal_window,
             )
         )
         cache_dir = str(metadata["output_dir"])
-        # Restore original loader if it was patched
-        if config.teacher_lora_path is not None:
+        # Restore original loader if it was patched (ARC path only)
+        if _gls is not None and _orig_load is not None:
             _gls._load_teacher_components = _orig_load
 
     train_cache, eval_cache, cache_metadata = _load_teacher_cache(cache_dir)

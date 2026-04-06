@@ -180,6 +180,170 @@ def choose_layer_indices(*, total_layers: int, explicit_layers: tuple[int, ...],
     return sorted(candidates)
 
 
+def _load_multimodal_teacher(
+    *,
+    foundation_model_id: str,
+    lora_path: str | None,
+    device: torch.device,
+) -> tuple[Any, Any]:
+    """Load Gemma multimodal model + processor, optionally with LoRA adapters."""
+    AutoModelForImageTextToText, AutoProcessor, _ = _lazy_import_transformers()
+    processor = AutoProcessor.from_pretrained(foundation_model_id, trust_remote_code=True)
+    if processor.tokenizer.pad_token is None:
+        processor.tokenizer.pad_token = processor.tokenizer.eos_token
+
+    torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    model = AutoModelForImageTextToText.from_pretrained(
+        foundation_model_id,
+        trust_remote_code=True,
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+    ).to(device)
+
+    if lora_path is not None:
+        from peft import PeftModel
+        model = PeftModel.from_pretrained(model, lora_path)
+
+    model.eval()
+    return processor, model
+
+
+def _make_mosaic(images: list[Any]) -> Any:
+    """Compose T PIL images into a 2×2 mosaic (or 1×T for T≤2)."""
+    from PIL import Image as PILImage
+    T = len(images)
+    w, h = images[0].size
+    if T == 1:
+        return images[0]
+    if T <= 2:
+        mosaic = PILImage.new("RGB", (w * T, h))
+        for i, img in enumerate(images):
+            mosaic.paste(img.resize((w, h)), (i * w, 0))
+    else:
+        imgs = (images + [images[-1]] * 4)[:4]
+        mosaic = PILImage.new("RGB", (w * 2, h * 2))
+        for i, img in enumerate(imgs):
+            mosaic.paste(img.resize((w, h)), ((i % 2) * w, (i // 2) * h))
+    return mosaic
+
+
+def build_teacher_features_auair(
+    *,
+    records: list[dict],
+    foundation_model_id: str,
+    lora_path: str | None,
+    layers: list[int],
+    max_length: int,
+    temporal_window: int,
+    device: torch.device,
+    batch_size: int = 4,
+) -> tuple[dict[int, torch.Tensor], torch.Tensor, torch.Tensor, int]:
+    """Extract hidden-layer features from Gemma on real AU-AIR frames.
+
+    Returns (features_by_layer, action_indices, halt_steps, hidden_layer_count).
+    action_indices and halt_steps are the GT labels from the first chunk step (a0).
+    """
+    from PIL import Image as PILImage
+
+    processor, model = _load_multimodal_teacher(
+        foundation_model_id=foundation_model_id,
+        lora_path=lora_path,
+        device=device,
+    )
+
+    def _load_images(paths: list[str], T: int) -> list[Any]:
+        if len(paths) < T:
+            paths = [paths[0]] * (T - len(paths)) + paths
+        paths = paths[-T:]
+        imgs = []
+        for p in paths:
+            try:
+                imgs.append(PILImage.open(p).convert("RGB"))
+            except Exception:
+                imgs.append(PILImage.new("RGB", (640, 480), color=(80, 80, 80)))
+        return imgs
+
+    def _build_prompt(T: int, C: int) -> str:
+        return (
+            f"You are an autonomous drone navigation assistant. "
+            f"You are given {T} consecutive aerial frames.\n\n"
+            "Predict the next drone action.\n"
+            "Action index: 0=north 1=south 2=east 3=west 4=up 5=down 6=yaw_right 7=yaw_left"
+        )
+
+    prompt_text = _build_prompt(temporal_window, 4)
+
+    feature_batches: dict[int, list[torch.Tensor]] = {layer: [] for layer in layers}
+    all_action_indices: list[int] = []
+    all_halt_steps: list[int] = []
+    hidden_layer_count = -1
+
+    with torch.no_grad():
+        for start in tqdm(range(0, len(records), batch_size), desc="auair teacher features"):
+            batch_records = records[start : start + batch_size]
+            mosaics = []
+            for rec in batch_records:
+                imgs = _load_images(rec.get("image_paths", []), temporal_window)
+                mosaics.append(_make_mosaic(imgs))
+                # GT a0
+                ai = rec.get("action_indices", [rec.get("action_index", 0)])
+                hs = rec.get("halt_steps", [rec.get("halt_step", 3)])
+                all_action_indices.append(int(ai[0]) if hasattr(ai, "__len__") else int(ai))
+                all_halt_steps.append(int(hs[0]) if hasattr(hs, "__len__") else int(hs))
+
+            try:
+                encoded = processor(
+                    text=[prompt_text] * len(mosaics),
+                    images=mosaics,
+                    return_tensors="pt",
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                ).to(device)
+            except Exception:
+                # fallback: process one by one then pad manually
+                items = []
+                for mosaic in mosaics:
+                    enc = processor(
+                        text=prompt_text,
+                        images=mosaic,
+                        return_tensors="pt",
+                        truncation=True,
+                        max_length=max_length,
+                    )
+                    items.append(enc)
+                # simple concat (no padding — batch may have different lengths, use last token pooling)
+                encoded = {k: torch.cat([it[k] for it in items], dim=0).to(device) for k in items[0]}
+
+            outputs = model(
+                **encoded,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+            hidden_states = _extract_hidden_states(outputs)
+            hidden_layer_count = len(hidden_states) - 1
+            attention_mask = encoded.get("attention_mask")
+            if attention_mask is not None:
+                token_positions = attention_mask.sum(dim=1) - 1
+            else:
+                token_positions = torch.full(
+                    (hidden_states[0].size(0),), hidden_states[0].size(1) - 1,
+                    dtype=torch.long, device=device,
+                )
+            for layer_index in layers:
+                layer_hidden = hidden_states[layer_index + 1]
+                pooled = layer_hidden[torch.arange(layer_hidden.size(0), device=device), token_positions]
+                feature_batches[layer_index].append(pooled.detach().cpu())
+
+    features_by_layer = {
+        layer_index: torch.cat(chunks, dim=0)
+        for layer_index, chunks in feature_batches.items()
+    }
+    action_indices_t = torch.tensor(all_action_indices, dtype=torch.long)
+    halt_steps_t = torch.tensor(all_halt_steps, dtype=torch.long)
+    return features_by_layer, action_indices_t, halt_steps_t, hidden_layer_count
+
+
 def build_teacher_features(
     *,
     tasks: list[Any],
