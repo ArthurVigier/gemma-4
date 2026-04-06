@@ -78,7 +78,6 @@ class ModelResult:
 def _parse_chunk(text: str, C: int) -> tuple[list[int] | None, list[int] | None]:
     """Extract actions and halts from model text output."""
     actions, halts = [], []
-    # Flexible regex: supports Action_0, Action 0, Action:0, etc.
     for i in range(C):
         am = re.search(rf"Action[_\s:]*{i}\s*[:\s-]*\s*(\d+)", text, re.IGNORECASE)
         hm = re.search(rf"Halt[_\s:]*{i}\s*[:\s-]*\s*(\d+)", text, re.IGNORECASE)
@@ -116,9 +115,7 @@ def _load_sequences(jsonl_path: Path, max_samples: int, seed: int = 42) -> list[
 
 
 def _make_mosaic(images: list[Image.Image]) -> Image.Image:
-    """Compose T frames into a 2×2 (or 1×T) mosaic as a single image.
-    Matches the training strategy to avoid transformers 5.5.0 multi-image bugs.
-    """
+    """Compose T frames into a 2×2 (or 1×T) mosaic as a single image."""
     T = len(images)
     if T == 0:
         return Image.new("RGB", (640, 480), color=(80, 80, 80))
@@ -130,7 +127,6 @@ def _make_mosaic(images: list[Image.Image]) -> Image.Image:
         for i, img in enumerate(images):
             mosaic.paste(img.resize((w, h)), (i * w, 0))
     else:
-        # 2×2 grid (pad with last frame if T<4)
         imgs = (images + [images[-1]] * 4)[:4]
         mosaic = Image.new("RGB", (w * 2, h * 2))
         for i, img in enumerate(imgs):
@@ -143,12 +139,33 @@ def _load_images(image_paths: list[str], T: int, images_path: str | None = None)
         image_paths = [image_paths[0]] * (T - len(image_paths)) + image_paths
     images = []
     base = Path(images_path) if images_path else None
+    
+    missing_count = 0
     for p in image_paths[-T:]:
+        # Robust resolution: try exact path, then filename in base dir
+        orig_path = Path(p)
+        resolved = orig_path
+        if base:
+            resolved = base / orig_path.name
+            
+        if not resolved.exists():
+            # Second attempt: check if it's in a subdirectory of base matching the original parent name
+            if base and len(orig_path.parts) > 1:
+                alt_resolved = base / orig_path.parent.name / orig_path.name
+                if alt_resolved.exists():
+                    resolved = alt_resolved
+
         try:
-            resolved = base / Path(p).name if base else Path(p)
-            images.append(Image.open(resolved).convert("RGB"))
-        except Exception:
+            img = Image.open(resolved).convert("RGB")
+            images.append(img)
+        except Exception as e:
+            missing_count += 1
+            logger.warning("Failed to load image at %s (orig: %s): %s", resolved, p, e)
             images.append(Image.new("RGB", (640, 480), color=(80, 80, 80)))
+            
+    if missing_count == T and T > 0:
+        logger.error("ALL images in sequence failed to load! Check --images-path.")
+        
     return images
 
 
@@ -178,10 +195,7 @@ def evaluate_gemma(
     model_name: str | None = None,
     images_path: str | None = None,
 ) -> ModelResult:
-    """
-    Evaluate Gemma 4 on AU-AIR sequences.
-    Uses a mosaic image to match training conditions.
-    """
+    """Evaluate Gemma 4 on AU-AIR sequences."""
     from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
 
     apply_submodule_patch()
@@ -226,7 +240,6 @@ def evaluate_gemma(
         gt_actions = (list(gt_actions) * C)[:C]
         gt_halts = (list(gt_halts) * C)[:C]
 
-        # Use chat template with single mosaic image
         content = [{"type": "image"}, {"type": "text", "text": prompt_tmpl}]
         messages = [{"role": "user", "content": content}]
 
@@ -250,12 +263,10 @@ def evaluate_gemma(
             il = inputs["input_ids"].shape[1]
             pred_text = processor.tokenizer.decode(out_ids[0][il:], skip_special_tokens=True)
             
-            # Debug: log the first response to see why parsing might fail
             if total == 0:
                 logger.info("[%s] First raw response sample:\n%s", name, pred_text)
 
             pa, ph = _parse_chunk(pred_text, C)
-
             if pa is not None:
                 parseable += 1
                 for c in range(C):
@@ -263,18 +274,13 @@ def evaluate_gemma(
                         correct_actions[c] += 1
                 if ph is not None and ph[0] == gt_halts[0]:
                     correct_halts += 1
-
         except Exception as e:
             logger.error("[%s] sample %s failed: %s", name, seq.get("sample_id"), e)
 
         total += 1
         if total % 50 == 0:
-            logger.info(
-                "[%s] progress %d/%d | parse=%.1f%%  acc=%.1f%%",
-                name, total, len(sequences),
-                parseable / total * 100,
-                correct_actions[0] / total * 100,
-            )
+            logger.info("[%s] progress %d/%d | parse=%.1f%%  acc=%.1f%%",
+                        name, total, len(sequences), parseable/total*100, correct_actions[0]/total*100)
 
     n_heuristic = sum(1 for s in sequences if s.get("used_heuristic", False))
     result = ModelResult(
@@ -286,10 +292,6 @@ def evaluate_gemma(
         ms_per_sample=float(np.mean(latencies)) if latencies else 0.0,
         n_samples=total,
         n_heuristic=n_heuristic,
-    )
-    logger.info(
-        "[%s] eval done | action0=%.1f%%  parse=%.1f%%  halt=%.1f%%  latency=%.0fms  n=%d",
-        name, result.action_acc, result.parse_rate, result.halt_acc, result.ms_per_sample, total,
     )
     return result
 
@@ -340,7 +342,6 @@ def evaluate_trm(
     total = 0
     latencies: list[float] = []
 
-    # Reuse AuAirStudentDataset for image→grid conversion
     import tempfile, json as _json
     tmp = Path(tempfile.mktemp(suffix=".jsonl"))
     tmp.write_text("\n".join(_json.dumps(s) for s in sequences))
@@ -350,49 +351,34 @@ def evaluate_trm(
     for i, seq in enumerate(sequences):
         gt_actions = (list(seq.get("action_indices", [seq.get("action_index", 0)] * C)) * C)[:C]
         gt_halts = (list(seq.get("halt_steps", [seq.get("halt_step", 3)] * C)) * C)[:C]
-
         item = ds[i]
         grids = item["grids"].unsqueeze(0).to(dev)
-
         t0 = time.perf_counter()
         with torch.no_grad():
             out = model(grids)
         latencies.append((time.perf_counter() - t0) * 1000)
-
-        # action_chunk_logits: (1, C, action_dim)
-        pred_actions = out.action_chunk_logits[0].argmax(dim=-1).tolist()  # [C]
+        pred_actions = out.action_chunk_logits[0].argmax(dim=-1).tolist()
         halt_pred = out.halted_at_step[0].item()
-
         for c in range(C):
             if pred_actions[c] == gt_actions[c]:
                 correct_actions[c] += 1
         if round(halt_pred) == gt_halts[0]:
             correct_halts += 1
-
         total += 1
         if total % 50 == 0:
-            logger.info(
-                "[%s] progress %d/%d | acc=%.1f%%",
-                name, total, len(sequences),
-                correct_actions[0] / total * 100,
-            )
+            logger.info("[%s] progress %d/%d | acc=%.1f%%", name, total, len(sequences), correct_actions[0]/total*100)
 
     n_heuristic = sum(1 for s in sequences if s.get("used_heuristic", False))
-    result = ModelResult(
+    return ModelResult(
         model_name=name,
         action_acc=correct_actions[0] / max(total, 1) * 100,
         chunk_acc=[correct_actions[c] / max(total, 1) * 100 for c in range(C)],
-        parse_rate=100.0,   # TRM always produces valid output
+        parse_rate=100.0,
         halt_acc=correct_halts / max(total, 1) * 100,
         ms_per_sample=float(np.mean(latencies)) if latencies else 0.0,
         n_samples=total,
         n_heuristic=n_heuristic,
     )
-    logger.info(
-        "[%s] eval done | action0=%.1f%%  halt=%.1f%%  latency=%.0fms  n=%d",
-        name, result.action_acc, result.halt_acc, result.ms_per_sample, total,
-    )
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +387,7 @@ def evaluate_trm(
 
 def adapt_and_evaluate_gemma(
     *,
-    adapt_sequences: list[dict],   # K examples from new environment
+    adapt_sequences: list[dict],
     eval_sequences: list[dict],
     model_id: str,
     base_lora_path: str,
@@ -412,9 +398,7 @@ def adapt_and_evaluate_gemma(
     device: str = "cuda",
     images_path: str | None = None,
 ) -> ModelResult:
-    """
-    NVARC-inspired test-time LoRA adaptation.
-    """
+    """NVARC-inspired test-time LoRA adaptation."""
     from transformers import AutoProcessor, AutoModelForImageTextToText, BitsAndBytesConfig
     from peft import PeftModel
 
@@ -438,15 +422,12 @@ def adapt_and_evaluate_gemma(
     )
     model = PeftModel.from_pretrained(base_model, base_lora_path, is_trainable=True)
 
-    # Only train LoRA params
     for name_p, param in model.named_parameters():
         param.requires_grad = "lora" in name_p
         if param.requires_grad and param.dtype != torch.bfloat16:
             param.data = param.data.to(torch.bfloat16)
 
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr=adapt_lr
-    )
+    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=adapt_lr)
 
     import tempfile
     tmp = Path(tempfile.mkdtemp())
@@ -480,7 +461,6 @@ def adapt_and_evaluate_gemma(
     model.eval()
     logger.info("[%s] Adaptation done — evaluating %d sequences...", name, len(eval_sequences))
 
-    # Evaluate using the adapted model (using mosaic)
     correct_actions = [0] * C
     correct_halts = 0
     parseable = 0
@@ -491,10 +471,8 @@ def adapt_and_evaluate_gemma(
     for seq in eval_sequences:
         raw_images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
         mosaic = _make_mosaic(raw_images)
-        
         gt_actions = (list(seq.get("action_indices", [seq.get("action_index", 0)] * C)) * C)[:C]
         gt_halts = (list(seq.get("halt_steps", [seq.get("halt_step", 3)] * C)) * C)[:C]
-
         content = [{"type": "image"}, {"type": "text", "text": prompt_tmpl}]
         messages = [{"role": "user", "content": content}]
 
@@ -507,48 +485,23 @@ def adapt_and_evaluate_gemma(
 
             t0 = time.perf_counter()
             with torch.no_grad():
-                out_ids = model.generate(
-                    **inputs, max_new_tokens=128, do_sample=False,
-                    pad_token_id=processor.tokenizer.eos_token_id,
-                )
+                out_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False, pad_token_id=processor.tokenizer.eos_token_id)
             latencies.append((time.perf_counter() - t0) * 1000)
-
             il = inputs["input_ids"].shape[1]
             pred_text = processor.tokenizer.decode(out_ids[0][il:], skip_special_tokens=True)
             pa, ph = _parse_chunk(pred_text, C)
             if pa is not None:
                 parseable += 1
                 for c in range(C):
-                    if pa[c] == gt_actions[c]:
-                        correct_actions[c] += 1
-                if ph is not None and ph[0] == gt_halts[0]:
-                    correct_halts += 1
+                    if pa[c] == gt_actions[c]: correct_actions[c] += 1
+                if ph is not None and ph[0] == gt_halts[0]: correct_halts += 1
         except Exception as e:
             logger.error("[%s] sample %s failed: %s", name, seq.get("sample_id"), e)
-
         total += 1
-        if total % 50 == 0:
-            logger.info(
-                "[%s] progress %d/%d | parse=%.1f%%  acc=%.1f%%",
-                name, total, len(eval_sequences),
-                parseable / total * 100,
-                correct_actions[0] / total * 100,
-            )
 
     n_heuristic = sum(1 for s in eval_sequences if s.get("used_heuristic", False))
-    result = ModelResult(
-        model_name=name,
-        action_acc=correct_actions[0] / max(total, 1) * 100,
-        chunk_acc=[correct_actions[c] / max(total, 1) * 100 for c in range(C)],
-        parse_rate=parseable / max(total, 1) * 100,
-        halt_acc=correct_halts / max(total, 1) * 100,
-        ms_per_sample=float(np.mean(latencies)) if latencies else 0.0,
-        n_samples=total,
-        n_heuristic=n_heuristic,
-        extra={"adapt_steps": step, "adapt_shots": len(adapt_sequences)},
+    return ModelResult(
+        model_name=name, action_acc=correct_actions[0] / max(total, 1) * 100, chunk_acc=[correct_actions[c] / max(total, 1) * 100 for c in range(C)],
+        parse_rate=parseable / max(total, 1) * 100, halt_acc=correct_halts / max(total, 1) * 100,
+        ms_per_sample=float(np.mean(latencies)) if latencies else 0.0, n_samples=total, n_heuristic=n_heuristic,
     )
-    logger.info(
-        "[%s] TTA eval done | action0=%.1f%%  parse=%.1f%%  halt=%.1f%%  latency=%.0fms  n=%d",
-        name, result.action_acc, result.parse_rate, result.halt_acc, result.ms_per_sample, total,
-    )
-    return result
