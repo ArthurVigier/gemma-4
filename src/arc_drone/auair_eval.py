@@ -131,14 +131,11 @@ def _load_images(image_paths: list[str], T: int, images_path: str | None = None)
                     if alt2.exists():
                         resolved = alt2
 
-        try:
-            if not resolved.exists():
-                raise FileNotFoundError(f"File not found: {resolved}")
-            img = Image.open(resolved).convert("RGB")
-            images.append(img)
-        except Exception as e:
-            logger.warning("Failed to load image at %s (orig: %s): %s", resolved, p, e)
-            images.append(Image.new("RGB", (224, 224), color=(80, 80, 80)))
+        if not resolved.exists():
+            raise FileNotFoundError(f"Image not found: {resolved} (original path: {p})")
+        
+        img = Image.open(resolved).convert("RGB")
+        images.append(img)
             
     return images
 

@@ -168,16 +168,16 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
 
         images = []
         for p in image_paths:
-            try:
-                if self.images_path:
-                    # Resolve relative to provided images root
-                    resolved_path = self.images_path / Path(p).name
-                else:
-                    resolved_path = Path(p)
-                images.append(Image.open(resolved_path).convert("RGB"))
-            except Exception as e:
-                logger.warning("Failed to load image %s: %s. Using fallback gray frame.", p, e)
-                images.append(Image.new("RGB", (640, 480), color=(80, 80, 80)))
+            if self.images_path:
+                # Resolve relative to provided images root
+                resolved_path = self.images_path / Path(p).name
+            else:
+                resolved_path = Path(p)
+                
+            if not resolved_path.exists():
+                raise FileNotFoundError(f"Image not found: {resolved_path} (original path: {p})")
+            
+            images.append(Image.open(resolved_path).convert("RGB"))
 
         # Compose T frames into single mosaic (avoids transformers 5.5.0 5D pixel_values bug)
         mosaic = self._make_mosaic(images)
