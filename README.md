@@ -1,184 +1,87 @@
 # ARC-Drone-Bench
 
-Workspace for porting ARC Prize style reasoning components to a simulated drone stack.
+Workspace for porting ARC Prize style reasoning components to autonomous drone navigation.
 
-- primary simulator stack: `Gazebo Harmonic + PX4 SITL + ROS 2 Jazzy`
-- secondary backend: `AirSim`
-- target pipeline: simulated image -> ARC-like grid -> abstract reasoning -> drone action
-- target model family: `Gemma-4-E2B/E4B` distilled into a TinyLM or TRM-like student under `50M` parameters
-- target inference path: `ONNX -> TensorRT / TensorRT-LLM`
+This project focuses on predicting drone navigation actions from multimodal temporal sequences (image grids) using a **Specialized Teacher (Gemma-4 VLM)** and distilling its reasoning into a **Global Attention Student (TRMReasoner)**.
 
-Current reference status:
+## Core Pipeline: Real-World AU-AIR Data
 
-- see `docs/stack_2026_validated.md` for the validated 2026 stack and sources
-- `ROS 2 Iron` is no longer a valid target for a new setup
-- `ROS 2 Humble + Gazebo Harmonic` is still tolerated, but it is not the default
-- heavy training and distillation must run on cloud GPUs
+We have transitioned from synthetic grids to the **AU-AIR** real-world drone dataset for ground-truth telemetry learning.
 
-## Structure
+1.  **Data Extraction:** Parse AU-AIR telemetry into sequential JSONL records with frame paths.
+2.  **Specialized Teacher:** Fine-tune `Gemma-4-E4B-it` on AU-AIR frames to predict 4-step action chunks.
+3.  **VLM Optimization:** Use **Unsloth FastVisionModel** for a 2x speedup. This prevents "Vision Blindness" by preserving full precision for the Vision Encoder while quantizing the LLM backbone.
+4.  **Student Distillation:** Distill the Teacher's high-fidelity internal representations into a compact, low-latency `TRMReasoner` student.
 
-- `src/arc_drone/pipeline_vision.py`: vision -> ARC-like 10-color grid conversion
-- `src/arc_drone/arc_drone_bench.py`: benchmark generation and evaluation
-- `src/arc_drone/model.py`: TRM-like core with recursive self-refinement and adaptive halting
-- `src/arc_drone/bringup.py`: Gazebo/PX4/ROS2 bringup helpers
-- `src/arc_drone/gazebo_px4_adapter.py`: Gazebo Harmonic + PX4 SITL + ROS 2 adapter
-- `src/arc_drone/live_benchmark.py`: live benchmark episodes and automatic JSONL export
-- `src/arc_drone/live_ros2_app.py`: executable ROS2 loop for the node
-- `src/arc_drone/benchmark_export.py`: benchmark episode export built from supervision snapshots/events
-- `src/arc_drone/supervision.py`: PX4 supervision JSON payloads and transition summaries
-- `launch/arc_drone_gazebo_px4.launch.py`: full bringup for MicroXRCEAgent + PX4 + Gazebo + bridges + node
-- `src/arc_drone/ros_node.py`: ROS2 node entrypoint
-- `src/arc_drone/export_tensorrt.py`: ONNX export and TensorRT commands
-- `tests/`: unit tests
+## Repository Structure
 
-## Quick Start
+- `src/arc_drone/auair_eval.py`: Core multi-model benchmark logic (Vanilla, LoRA, Student).
+- `src/arc_drone/teacher_finetuning_unsloth.py`: High-speed multimodal fine-tuning module.
+- `src/arc_drone/model.py`: TRM Student architecture with recursive self-refinement.
+- `scripts/finetune_unsloth.py`: CLI for optimized Teacher training.
+- `scripts/benchmark_auair.py`: CLI for standardized drone navigation benchmarking.
+- `scripts/parse_auair.py`: Dataset preparation tool.
 
+## Technical Fixes & Constraints
+
+### 1. The "Gray Image" VLM Hallucination
+Standard `BitsAndBytes` 4-bit quantization destructively corrupts the SigLIP/ViT Vision Tower in Gemma-4. We resolved this by:
+- Using **Unsloth** for training (which protects the vision tower).
+- Using **Native bfloat16** for evaluation (to ensure the model can "see").
+- Standardizing inputs to a **448x448 Mosaic** (4 frames of 224x224 each).
+
+### 2. Environment Isolation (PyTorch 2.6.0 Workaround)
+Due to kernel incompatibilities in PyTorch 2.6.0 (missing sub-byte dtypes and `infer_schema` errors), Unsloth training must run in an isolated virtual environment.
+
+**Setup Unsloth Environment:**
 ```bash
-python3 -m pip install -e '.[dev]'
+python -m venv unsloth_env
+source unsloth_env/bin/activate
+pip install --upgrade pip
+pip install --no-cache-dir torch==2.5.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install --no-cache-dir "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+pip install --no-cache-dir unsloth_zoo trl
 ```
 
-## Tests
+## Running the Pipeline
 
+### Step 1: Dataset Preparation
 ```bash
-pytest
+python scripts/parse_auair.py \
+  --images-dir /path/to/images \
+  --annotations data/annotations.json \
+  --output data/auair_sequences.jsonl
 ```
 
-## Cloud GPU Smoke Test
-
-On a cloud GPU VM with CUDA available:
-
+### Step 2: Teacher Fine-Tuning (Isolated Env)
 ```bash
-python3 -m pip install -e '.[training]'
-python3 scripts/run_gpu_smoke.py --export-onnx
+nohup ./unsloth_env/bin/python scripts/finetune_unsloth.py \
+    --auair-path data/auair_sequences.jsonl \
+    --auair-images-path /workspace/gemma-4/images \
+    --epochs 3 \
+    --batch-size 8 \
+    --gradient-accumulation-steps 2 > logs/finetune_unsloth.log 2>&1 &
 ```
 
-Or with the shell wrapper:
-
+### Step 3: Benchmarking (Standard Env)
 ```bash
-bash scripts/run_gpu_smoke.sh
+python scripts/benchmark_auair.py \
+    --sequences data/auair_sequences.jsonl \
+    --images-path /workspace/gemma-4/images \
+    --model-id google/gemma-4-e4b-it \
+    --lora-path artifacts/teacher_lora/gemma_e4b_auair \
+    --n-eval 300
 ```
 
-This command:
+## Hardware Requirements
 
-- checks that CUDA is available
-- runs one TRM-like forward pass on GPU
-- exports ONNX to `artifacts/onnx/trm_reasoner.onnx`
-- prints the next `trtexec` command for TensorRT engine generation
+- **Fine-Tuning:** NVIDIA A100 (80GB) or H100 recommended for large batches. RTX 3090/4090/A6000 (24GB+) is sufficient for Unsloth 4-bit training.
+- **Inference:** Target deployment on mobile platforms via `PyTorch -> ONNX -> TensorRT (INT8)`.
 
-For this stage, I recommend renting a GPU with at least 40 GB of VRAM, for example an A100 40/80GB on RunPod or Vast.ai.
+## Legacy Simulation Stack (Optional)
+The project still supports symbolic reasoning from simulated imagery using:
+- **Simulator:** `Gazebo Harmonic + PX4 SITL + ROS 2 Jazzy`
+- **Bridge:** `Micro-XRCE-DDS`
+- **Vision:** `src/arc_drone/pipeline_vision.py` (Image to 10-color grid)
 
-## Student Training CLI
-
-The repo now includes a runnable student-training command for the TRM-like model:
-
-```bash
-python3 scripts/train_trm_student.py \
-  --device cuda \
-  --task-count 4096 \
-  --eval-task-count 512 \
-  --batch-size 32 \
-  --epochs 5 \
-  --output-dir artifacts/checkpoints/trm_student_run1 \
-  --export-onnx
-```
-
-This command:
-
-- trains the current TRM-like student directly on `ARC-Drone-Bench`
-- writes epoch checkpoints and `training_summary.json`
-- optionally exports the trained student to ONNX and prints the next `trtexec` command
-
-This is the runnable student-training stage in the current scaffold. Teacher-assisted `Gemma-4 + Unsloth + PEFT + BitsAndBytes` distillation remains the next extension on top of this GPU-ready baseline.
-
-## ROS2 / Gazebo / PX4 Bringup
-
-Example:
-
-```bash
-python3 scripts/validate_gazebo_mission_world.py
-
-ros2 launch /path/to/gemma-4/launch/arc_drone_gazebo_px4.launch.py \
-  px4_autopilot_path:=/path/to/PX4-Autopilot \
-  px4_make_target:=gz_x500_depth
-```
-
-Useful live benchmark options:
-
-```bash
-python3 -m arc_drone.live_ros2_app \
-  --benchmark-output-path artifacts/benchmark/live_benchmark_metrics.jsonl \
-  --benchmark-task-count 200 \
-  --benchmark-max-episode-steps 100 \
-  --benchmark-ready-timeout-steps 40 \
-  --benchmark-rotate-max-rows 1000
-```
-
-Default bridged topics:
-
-- Gazebo clock: `/world/default/clock` -> `/clock`
-- Gazebo image: `/camera` -> `/camera/image_raw`
-- Gazebo camera info: `/camera_info` -> `/camera/camera_info`
-- Gazebo mission marker odometry: `/model/arc_marker_*/odometry` -> `/arc_drone/mission_markers/arc_marker_*/odometry`
-
-These topics can be overridden at launch time if the PX4 vehicle model exposes different sensor names.
-
-Local mission world assets are provided under:
-
-- `assets/gazebo/worlds/arc_drone_bench_mission.world`
-- `assets/gazebo/models/arc_marker_*`
-
-The validation helper checks that the world file contains all mission markers required by `ARC-Drone-Bench` before launch.
-
-## Supervision Topics
-
-The node publishes:
-
-- `arc_drone/control_state` as `std_msgs/String`
-  JSON with the aggregated PX4 state, NED pose/velocity, and the latest action
-- `arc_drone/control_events` as `std_msgs/String`
-  JSON event per transition or incident such as `ready`, `armed`, `offboard`, `failsafe`, or `command_error`
-- `arc_drone/benchmark_metrics` as `std_msgs/String`
-  JSON benchmark episode payload published when an episode finishes
-
-## Benchmark Export
-
-`BenchmarkSupervisionExporter` combines:
-
-- ARC metrics: `grid_accuracy`, `action_accuracy`, `latency_ms`, `energy_joules`
-- supervision metrics: `time_to_ready_ms`, offboard/arming transitions, command errors, failsafe
-
-Output:
-
-- JSONL export through `export_to_jsonl(...)`
-- automatic JSONL writing in the live loop at the end of each episode
-- automatic rotation:
-  - one timestamped filename per run
-  - row-count rotation via `rotate_max_rows_per_file`
-
-Live episode termination uses real control outcomes instead of a fixed step count:
-
-- `success`
-- `failsafe`
-- `command_error`
-- `offboard_lost`
-- `ready_timeout`
-- `max_steps_guard`
-
-The success condition is now simulator-aware:
-
-- symbolic success requires exact ARC grid match plus correct action
-- physical success requires entering the live Gazebo mission marker radius, using bridged marker/entity odometry instead of a synthetic task center
-- final success requires both, plus `ready_for_control` when configured
-
-## Architecture Notes
-
-This scaffold validates:
-
-1. ARC-like symbolic representations from simulated imagery
-2. synthetic `ARC-Drone-Bench` task generation
-3. a compact recursive core with adaptive halting
-4. ROS2 / TensorRT integration points
-
-Training or distilling `Gemma-4-E2B/E4B` with `Unsloth`, `PEFT`, `QLoRA`, and `BitsAndBytes` is not executed locally in this scaffold. That phase should run on cloud GPUs.
-
-For that stage, I recommend renting a GPU with at least 40 GB of VRAM, for example an A100 40/80GB on RunPod or Vast.ai.
+See `docs/stack_2026_validated.md` for simulator setup details.
