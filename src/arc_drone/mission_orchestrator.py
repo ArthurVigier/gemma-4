@@ -10,6 +10,7 @@ from typing import List
 from .system1_pilot import System1Pilot, PilotStatus
 from .system2_mastermind import System2Mastermind
 from .visual_crisis_analyzer import VisualCrisisAnalyzer
+from .sar_comm_hub import SARCommunicationHub
 
 logger = logging.getLogger(__name__)
 
@@ -20,8 +21,8 @@ class MissionOrchestrator:
         self.is_running = False
         self.active_emergencies: List[dict[str, Any]] = []
         
-        # New: Visual analyzers for each pilot to maintain temporal context
         self.visual_analyzers = {p.drone_id: VisualCrisisAnalyzer() for p in pilots}
+        self.comm_hub = SARCommunicationHub()
 
     def run_mission(self, duration_steps: int = 1000, dt: float = 0.01):
         """Main execution loop for SAR missions."""
@@ -34,35 +35,34 @@ class MissionOrchestrator:
             swarm_state = [p.get_semantic_state() for p in self.pilots]
 
             for pilot in self.pilots:
-                # 1. Pilot takes a physical step
                 status = pilot.step(dt)
                 
-                # 2. Buffer visual data for temporal reasoning
                 if pilot.adapter:
                     frame = pilot.adapter.get_camera_image()
                     self.visual_analyzers[pilot.drone_id].push_frame(frame, current_time)
                 
-                # 3. Handle emergencies
                 if status == PilotStatus.OOD_ENCOUNTERED:
                     logger.warning("CRITICAL: OOD detected by %s. Requesting Mastermind Triage...", pilot.drone_id)
                     
-                    # Get the visual clip for Gemma-4 26B MoE
                     clip = self.visual_analyzers[pilot.drone_id].get_crisis_clip()
                     
                     emergency = {
                         "drone_id": pilot.drone_id,
-                        "description": "Unknown anomaly with temporal patterns.",
+                        "description": "Moving human silhouette on flood-damaged rooftop.",
                         "pose": pilot.local_pose,
                         "severity": "HIGH"
                     }
                     self.active_emergencies.append(emergency)
                     
-                    # Strategic reasoning with MULTI-FRAME input
                     strategy = self.mastermind.reason_sar(
                         fleet_state=swarm_state, 
                         emergencies=self.active_emergencies,
                         visual_input=clip
                     )
+                    
+                    # New: Broadcast to human rescuers via Comm Hub
+                    self.comm_hub.broadcast_sitrep(pilot.drone_id, strategy)
+                    
                     self.mastermind.execute_strategy(pilot, strategy)
                     
                     self.active_emergencies.clear()
