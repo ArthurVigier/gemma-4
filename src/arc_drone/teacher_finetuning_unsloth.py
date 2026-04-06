@@ -65,7 +65,7 @@ class AuAirTeacherConfig:
 # Dataset
 # ---------------------------------------------------------------------------
 
-class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
+class AuAirTeacherDataset(Dataset[dict[str, Any]]):
     def __init__(self, jsonl_path: Path, processor: Any, max_length: int, temporal_window: int, action_chunk_size: int, images_path: str | Path | None = None) -> None:
         self.processor = processor
         self.T = temporal_window
@@ -76,39 +76,54 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
 
     def __len__(self) -> int: return len(self.records)
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+    @staticmethod
+    def _make_mosaic(images: list[Image.Image]) -> Image.Image:
+        T = len(images)
+        res_size = 224
+        imgs = [img.resize((res_size, res_size), Image.Resampling.LANCZOS) for img in images]
+        if T == 1: return imgs[0]
+        mosaic = Image.new("RGB", (res_size*2, res_size*2))
+        for i in range(4):
+            mosaic.paste(imgs[min(i, len(imgs)-1)], ((i%2)*res_size, (i//2)*res_size))
+        return mosaic
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
         rec = self.records[index]
-        image_paths = (rec.get("image_paths", []) + [rec.get("image_paths", [""])[0]]*self.T)[:self.T]
+        image_paths = rec.get("image_paths", [])
+        if not image_paths:
+            image_paths = [""] * self.T
+        elif len(image_paths) < self.T:
+            image_paths = [image_paths[0]] * (self.T - len(image_paths)) + image_paths
+        image_paths = image_paths[-self.T:]
+
         images = []
         for p in image_paths:
-            res = self.images_path / Path(p).name if self.images_path else Path(p)
-            images.append(Image.open(res).convert("RGB"))
+            res = self.images_path / Path(p).name if self.images_path and p else Path(p)
+            try:
+                img = Image.open(res).convert("RGB")
+                images.append(img)
+            except Exception:
+                images.append(Image.new("RGB", (224, 224), color=(80, 80, 80)))
 
-        # Mosaic 2x2
-        res_size = 224
-        imgs = [img.resize((res_size, res_size)) for img in images]
-        mosaic = Image.new("RGB", (res_size*2, res_size*2))
-        for i in range(4): mosaic.paste(imgs[min(i, len(imgs)-1)], ((i%2)*res_size, (i//2)*res_size))
+        mosaic = self._make_mosaic(images)
 
-        ai = (list(rec.get("action_indices", [rec.get("action_index", 0)]*self.C)) * self.C)[:self.C]
-        hs = (list(rec.get("halt_steps", [rec.get("halt_step", 3)]*self.C)) * self.C)[:self.C]
-        ans = "\n".join(f"Action_{i}: {ai[i]}  Halt_{i}: {hs[i]}" for i in range(self.C))
+        ai_raw = rec.get("action_indices", [rec.get("action_index", 0)] * self.C)
+        hs_raw = rec.get("halt_steps", [rec.get("halt_step", 3)] * self.C)
+        ai = (list(ai_raw) * self.C)[:self.C]
+        hs = (list(hs_raw) * self.C)[:self.C]
         
-        msgs = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": _user_prompt(self.T, self.C)}]},
-                {"role": "assistant", "content": [{"type": "text", "text": ans}]}]
+        answer = "\n".join(f"Action_{i}: {ai[i]}  Halt_{i}: {hs[i]}" for i in range(self.C))
         
-        full_text = self.processor.apply_chat_template(msgs, tokenize=False)
-        inputs = self.processor(text=full_text, images=mosaic, return_tensors="pt", padding="max_length", max_length=self.max_length, truncation=True)
-        payload = {k: v.squeeze(0) for k, v in inputs.items()}
+        # Format for UnslothVisionDataCollator
+        messages = [
+            {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": _user_prompt(self.T, self.C)}]},
+            {"role": "assistant", "content": [{"type": "text", "text": answer}]}
+        ]
         
-        prompt = self.processor.apply_chat_template(msgs[:1], tokenize=False, add_generation_prompt=True)
-        prompt_len = self.processor(text=prompt, images=mosaic, return_tensors="pt").input_ids.shape[1]
-        
-        labels = payload["input_ids"].clone()
-        labels[:prompt_len] = -100
-        labels[payload["attention_mask"] == 0] = -100
-        payload["labels"] = labels
-        return payload
+        return {
+            "messages": messages,
+            "images": [mosaic],
+        }
 
 # ---------------------------------------------------------------------------
 # Training
