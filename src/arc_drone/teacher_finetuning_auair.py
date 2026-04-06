@@ -262,7 +262,7 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
 
     AutoModelForImageTextToText, AutoProcessor, _ = _lazy_import_transformers()
     from peft import LoraConfig, get_peft_model
-    from transformers import BitsAndBytesConfig, get_cosine_schedule_with_warmup
+    from transformers import get_cosine_schedule_with_warmup
 
     logger.info("--- AU-AIR Teacher Fine-tuning (GT telemetry labels) ---")
     logger.info("Model:  %s", config.foundation_model_id)
@@ -305,15 +305,9 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
             setattr(mod, atoms[-1], module)
         _nn.Module.set_submodule = _set_submodule
 
-    logger.info("Loading model in 4-bit QLoRA...")
-    bnb = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-    )
+    logger.info("Loading model in native bfloat16 (full precision vision)...")
     model = AutoModelForImageTextToText.from_pretrained(
         config.foundation_model_id,
-        quantization_config=bnb,
         device_map={"": 0},
         dtype=torch.bfloat16,
         attn_implementation="sdpa",
@@ -323,8 +317,6 @@ def finetune_auair_teacher(config: AuAirTeacherConfig) -> dict[str, Any]:
 
     for param in model.parameters():
         param.requires_grad = False
-        if param.dtype == torch.float32:
-            param.data = param.data.to(torch.bfloat16)
 
     lora_config = LoraConfig(
         r=config.lora_r,
