@@ -263,15 +263,22 @@ def build_teacher_features_auair(
                 imgs.append(PILImage.new("RGB", (640, 480), color=(80, 80, 80)))
         return imgs
 
-    def _build_prompt(T: int, C: int) -> str:
-        return (
-            f"You are an autonomous drone navigation assistant. "
-            f"You are given {T} consecutive aerial frames.\n\n"
-            "Predict the next drone action.\n"
-            "Action index: 0=north 1=south 2=east 3=west 4=up 5=down 6=yaw_right 7=yaw_left"
-        )
-
-    prompt_text = _build_prompt(temporal_window, 4)
+    user_text = (
+        f"You are an autonomous drone navigation assistant. "
+        f"You are given {temporal_window} consecutive aerial frames.\n\n"
+        "Predict the next drone action.\n"
+        "Action index: 0=north 1=south 2=east 3=west 4=up 5=down 6=yaw_right 7=yaw_left"
+    )
+    # Build prompt string with image token via chat template
+    has_chat_template = bool(
+        getattr(processor, "chat_template", None)
+        or getattr(getattr(processor, "tokenizer", None), "chat_template", None)
+    )
+    if has_chat_template:
+        messages = [{"role": "user", "content": [{"type": "image"}, {"type": "text", "text": user_text}]}]
+        prompt_text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    else:
+        prompt_text = "<image_0>\n" + user_text + "\n"
 
     feature_batches: dict[int, list[torch.Tensor]] = {layer: [] for layer in layers}
     all_action_indices: list[int] = []
@@ -291,50 +298,35 @@ def build_teacher_features_auair(
                 all_action_indices.append(int(ai[0]) if hasattr(ai, "__len__") else int(ai))
                 all_halt_steps.append(int(hs[0]) if hasattr(hs, "__len__") else int(hs))
 
-            try:
-                encoded = processor(
-                    text=[prompt_text] * len(mosaics),
-                    images=mosaics,
+            # Process one by one (batching multimodal inputs with padding is fragile for Gemma4)
+            items = []
+            for mosaic in mosaics:
+                enc = processor(
+                    text=prompt_text,
+                    images=mosaic,
                     return_tensors="pt",
-                    padding=True,
                     truncation=True,
                     max_length=max_length,
-                ).to(device)
-            except Exception:
-                # fallback: process one by one then pad manually
-                items = []
-                for mosaic in mosaics:
-                    enc = processor(
-                        text=prompt_text,
-                        images=mosaic,
-                        return_tensors="pt",
-                        truncation=True,
-                        max_length=max_length,
-                    )
-                    items.append(enc)
-                # simple concat (no padding — batch may have different lengths, use last token pooling)
-                encoded = {k: torch.cat([it[k] for it in items], dim=0).to(device) for k in items[0]}
-
-            outputs = model(
-                **encoded,
-                output_hidden_states=True,
-                return_dict=True,
-            )
-            hidden_states = _extract_hidden_states(outputs)
-            hidden_layer_count = len(hidden_states) - 1
-            attention_mask = encoded.get("attention_mask")
-            if attention_mask is not None:
-                token_positions = attention_mask.sum(dim=1) - 1
-            else:
-                token_positions = torch.full(
-                    (hidden_states[0].size(0),), hidden_states[0].size(1) - 1,
-                    dtype=torch.long, device=device,
                 )
+                items.append({k: v.to(device) for k, v in enc.items()})
+            # Run forward pass individually to avoid batch-padding issues
+            batch_hidden: dict[int, list[torch.Tensor]] = {layer: [] for layer in layers}
+            for item in items:
+                outputs = model(
+                    **item,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+                hidden_states = _extract_hidden_states(outputs)
+                hidden_layer_count = len(hidden_states) - 1
+                attn = item.get("attention_mask")
+                pos = (attn.sum(dim=1) - 1) if attn is not None else torch.tensor([hidden_states[0].size(1) - 1], device=device)
+                for layer_index in layers:
+                    layer_hidden = hidden_states[layer_index + 1]
+                    pooled = layer_hidden[torch.arange(layer_hidden.size(0), device=device), pos]
+                    batch_hidden[layer_index].append(pooled.detach().cpu())
             for layer_index in layers:
-                layer_hidden = hidden_states[layer_index + 1]
-                pooled = layer_hidden[torch.arange(layer_hidden.size(0), device=device), token_positions]
-                feature_batches[layer_index].append(pooled.detach().cpu())
-
+                feature_batches[layer_index].append(torch.cat(batch_hidden[layer_index], dim=0))
     features_by_layer = {
         layer_index: torch.cat(chunks, dim=0)
         for layer_index, chunks in feature_batches.items()
