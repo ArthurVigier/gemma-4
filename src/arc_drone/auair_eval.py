@@ -127,6 +127,7 @@ def evaluate_gemma(
     action_chunk_size: int = 4,
     device: str = "cuda",
     model_name: str | None = None,
+    images_path: str | None = None,
 ) -> ModelResult:
     """
     Evaluate Gemma 4 on AU-AIR sequences.
@@ -179,7 +180,7 @@ def evaluate_gemma(
     prompt_tmpl = _user_prompt(T, C)
 
     for seq in sequences:
-        images = _load_images(seq.get("image_paths", []), T)
+        images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
         gt_actions = seq.get("action_indices", [seq.get("action_index", 0)] * C)
         gt_halts = seq.get("halt_steps", [seq.get("halt_step", 3)] * C)
         gt_actions = (list(gt_actions) * C)[:C]
@@ -364,6 +365,7 @@ def adapt_and_evaluate_gemma(
     temporal_window: int = 4,
     action_chunk_size: int = 4,
     device: str = "cuda",
+    images_path: str | None = None,
 ) -> ModelResult:
     """
     NVARC-inspired test-time LoRA adaptation.
@@ -422,6 +424,7 @@ def adapt_and_evaluate_gemma(
     adapt_ds = AuAirTeacherDataset(
         adapt_jsonl, processor, max_length=512,
         temporal_window=T, action_chunk_size=C,
+        images_path=images_path,
     )
     from torch.utils.data import DataLoader
     adapt_loader = DataLoader(adapt_ds, batch_size=min(4, len(adapt_sequences)), shuffle=True)
@@ -453,7 +456,7 @@ def adapt_and_evaluate_gemma(
     prompt_tmpl = _user_prompt(T, C)
 
     for seq in eval_sequences:
-        images = _load_images(seq.get("image_paths", []), T)
+        images = _load_images(seq.get("image_paths", []), T, images_path=images_path)
         gt_actions = (list(seq.get("action_indices", [seq.get("action_index", 0)] * C)) * C)[:C]
         gt_halts = (list(seq.get("halt_steps", [seq.get("halt_step", 3)] * C)) * C)[:C]
 
