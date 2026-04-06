@@ -47,11 +47,14 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output-dir", default="artifacts/teacher_lora/gemma_e4b_auair")
     parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--auair-images-path", type=str, default=None,
+                        help="Root directory for AU-AIR images. Filenames from JSONL will be resolved relative to this.")
     args = parser.parse_args()
 
     config = AuAirTeacherConfig(
         foundation_model_id=args.foundation_model_id,
         auair_path=args.auair_path,
+        auair_images_path=args.auair_images_path,
         temporal_window=args.temporal_window,
         action_chunk_size=args.action_chunk_size,
         task_count=args.task_count,

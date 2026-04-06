@@ -67,6 +67,7 @@ class StudentTrainingConfig:
     # Path to JSONL produced by scripts/parse_auair.py.
     # When set, trains on real AU-AIR temporal sequences instead of synthetic ARC tasks.
     auair_path: str | None = None
+    auair_images_path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,10 +113,12 @@ class AuAirStudentDataset(Dataset[dict[str, torch.Tensor]]):
         reasoner_config: ReasonerConfig,
         grid_height: int = 30,
         grid_width: int = 30,
+        images_path: Path | str | None = None,
     ) -> None:
         self.reasoner_config = reasoner_config
         self.grid_height = grid_height
         self.grid_width = grid_width
+        self.images_path = Path(images_path) if images_path else None
 
         self.records: list[dict] = []
         with open(jsonl_path, encoding="utf-8") as f:
@@ -129,7 +132,17 @@ class AuAirStudentDataset(Dataset[dict[str, torch.Tensor]]):
 
     def _image_to_grid(self, image_path: str) -> np.ndarray:
         from PIL import Image as PILImage
-        img = PILImage.open(image_path).convert("RGB")
+        
+        # Rebase image path if images_path is set
+        if self.images_path:
+            # We assume image_path might be absolute to some other location
+            # so we just take the filename and join it with our local images_path.
+            filename = Path(image_path).name
+            resolved_path = self.images_path / filename
+        else:
+            resolved_path = Path(image_path)
+
+        img = PILImage.open(resolved_path).convert("RGB")
         img = img.resize((self.grid_width, self.grid_height))
         arr = np.asarray(img, dtype=np.float32)
         # Map RGB → ARC color index (0-9) via channel binning
@@ -346,8 +359,12 @@ def build_dataloaders(
             time.perf_counter() - t0, train_n, eval_n,
         )
 
-        train_dataset: Dataset = AuAirStudentDataset(train_jsonl, reasoner_config)
-        eval_dataset: Dataset = AuAirStudentDataset(eval_jsonl, reasoner_config)
+        train_dataset: Dataset = AuAirStudentDataset(
+            train_jsonl, reasoner_config, images_path=config.auair_images_path
+        )
+        eval_dataset: Dataset = AuAirStudentDataset(
+            eval_jsonl, reasoner_config, images_path=config.auair_images_path
+        )
     else:
         train_bench = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed))
         eval_bench = ARCDroneBench(BenchmarkConfig(task_count=config.eval_task_count, seed=config.seed + 1))

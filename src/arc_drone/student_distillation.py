@@ -57,6 +57,7 @@ class DistillationCacheConfig:
     teacher_max_length: int = 768
     # When set, use real AU-AIR sequences instead of synthetic ARC tasks
     auair_path: str | None = None
+    auair_images_path: str | None = None
     teacher_lora_path: str | None = None
     temporal_window: int = 4
 
@@ -99,6 +100,7 @@ class DistillationConfig:
     action_chunk_size: int = 4
     # When set, build teacher cache from real AU-AIR sequences instead of synthetic ARC tasks
     auair_path: str | None = None
+    auair_images_path: str | None = None
 
 
 class CachedDistillationDataset(Dataset[dict[str, torch.Tensor]]):
@@ -210,14 +212,19 @@ def _project_teacher_logits(
     return torch.cat(action_logits_batches, dim=0), torch.cat(halt_logits_batches, dim=0)
 
 
-def _stack_base_dataset(base_dataset: ArcStudentDataset) -> dict[str, torch.Tensor | list[str]]:
+def _stack_base_dataset(base_dataset: ArcStudentDataset | AuAirStudentDataset) -> dict[str, torch.Tensor | list[str]]:
     grids = torch.stack([base_dataset[index]["grids"] for index in range(len(base_dataset))])
     # action_indices is (C,) per sample — take a0 (current action) as scalar target
     action_indices = torch.stack([base_dataset[index]["action_indices"][0] for index in range(len(base_dataset))])
     # action_target_vectors is (C, 4) per sample — take a0
     action_target_vectors = torch.stack([base_dataset[index]["action_target_vectors"][0] for index in range(len(base_dataset))])
     halt_steps = torch.stack([base_dataset[index]["halt_step"] for index in range(len(base_dataset))])
-    task_ids = [base_dataset.tasks[index].task_id for index in range(len(base_dataset))]
+    
+    if hasattr(base_dataset, "tasks"):
+        task_ids = [base_dataset.tasks[index].task_id for index in range(len(base_dataset))]
+    else:
+        task_ids = [str(index) for index in range(len(base_dataset))]
+        
     return {
         "grid": grids,
         "action_index": action_indices,
@@ -229,7 +236,7 @@ def _stack_base_dataset(base_dataset: ArcStudentDataset) -> dict[str, torch.Tens
 
 def _cache_split_payload(
     *,
-    base_dataset: ArcStudentDataset,
+    base_dataset: ArcStudentDataset | AuAirStudentDataset,
     teacher_features: torch.Tensor,
     teacher_action_logits: torch.Tensor,
     teacher_halt_logits: torch.Tensor,
@@ -285,11 +292,11 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
         logger.info("AU-AIR cache: %d train / %d eval sequences", len(train_records), len(eval_records))
 
         train_base = AuAirStudentDataset(
-            Path(config.auair_path), reasoner_config,
+            Path(config.auair_path), reasoner_config, images_path=config.auair_images_path,
         )
         train_base.records = train_records  # type: ignore[attr-defined]
         eval_base = AuAirStudentDataset(
-            Path(config.auair_path), reasoner_config,
+            Path(config.auair_path), reasoner_config, images_path=config.auair_images_path,
         )
         eval_base.records = eval_records  # type: ignore[attr-defined]
 
@@ -317,6 +324,8 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
             device=device,
         )
         logger.info("Eval teacher features built in %.1fs", time.perf_counter() - t0)
+        train_task_count = len(train_records)
+        eval_task_count = len(eval_records)
     else:
         # --- Synthetic ARC tasks path (original) ---
         train_tasks = ARCDroneBench(BenchmarkConfig(task_count=config.task_count, seed=config.seed)).generate_tasks()
@@ -347,6 +356,8 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
         logger.info("Eval teacher features built in %.1fs", time.perf_counter() - t0)
         train_action_indices = torch.stack([train_base[index]["action_indices"][0] for index in range(len(train_base))])
         train_halt_steps = torch.stack([train_base[index]["halt_step"] for index in range(len(train_base))])
+        train_task_count = len(train_tasks)
+        eval_task_count = len(eval_tasks)
 
     combined_train_features = _combine_teacher_features(
         features_by_layer=train_features_by_layer,
@@ -421,8 +432,8 @@ def build_teacher_target_cache(config: DistillationCacheConfig) -> dict[str, obj
         "teacher_feature_pooling": config.teacher_feature_pooling,
         "teacher_feature_dim": int(combined_train_features.shape[-1]),
         "hidden_layer_count": hidden_layer_count,
-        "train_task_count": len(train_tasks),
-        "eval_task_count": len(eval_tasks),
+        "train_task_count": train_task_count,
+        "eval_task_count": eval_task_count,
         "train_cache_path": train_cache_path.as_posix(),
         "eval_cache_path": eval_cache_path.as_posix(),
         "teacher_probe_path": teacher_probe_path.as_posix(),
@@ -598,6 +609,7 @@ def distill_student(config: DistillationConfig) -> StudentTrainingSummary:
                 teacher_probe_batch_size=config.teacher_probe_batch_size,
                 teacher_max_length=config.teacher_max_length,
                 auair_path=config.auair_path,
+                auair_images_path=config.auair_images_path,
                 teacher_lora_path=config.teacher_lora_path,
                 temporal_window=config.temporal_window,
             )

@@ -51,6 +51,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auair-path", type=str, default=None,
                         help="JSONL from parse_auair.py. When set, trains on real AU-AIR "
                              "sequences instead of synthetic ARC tasks.")
+    parser.add_argument("--auair-images-path", type=str, default=None,
+                        help="Root directory for AU-AIR images. Filenames from JSONL will be resolved relative to this.")
     return parser.parse_args()
 
 
@@ -86,6 +88,7 @@ def main() -> int:
             temporal_window=args.temporal_window,
             action_chunk_size=args.action_chunk_size,
             auair_path=args.auair_path,
+            auair_images_path=args.auair_images_path,
         )
     )
     logger.info(

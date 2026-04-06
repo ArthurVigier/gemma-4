@@ -14,17 +14,17 @@ Output: JSON report + stdout comparison table.
 
 Usage examples:
   # Vanilla baseline only
-  python scripts/benchmark_auair.py \\
-    --sequences data/auair_sequences.jsonl \\
+  python scripts/benchmark_auair.py \
+    --sequences data/auair_sequences.jsonl \
     --model-id google/gemma-4-e4b-it
 
   # Full comparison
-  python scripts/benchmark_auair.py \\
-    --sequences data/auair_sequences.jsonl \\
-    --model-id google/gemma-4-e4b-it \\
-    --lora-path artifacts/teacher_lora/gemma_e4b_auair \\
-    --trm-checkpoint artifacts/checkpoints/trm_student/best_student.pt \\
-    --tta-shots 16 \\
+  python scripts/benchmark_auair.py \
+    --sequences data/auair_sequences.jsonl \
+    --model-id google/gemma-4-e4b-it \
+    --lora-path artifacts/teacher_lora/gemma_e4b_auair \
+    --trm-checkpoint artifacts/checkpoints/trm_student/best_student.pt \
+    --tta-shots 16 \
     --n-eval 500
 """
 from __future__ import annotations
@@ -35,6 +35,8 @@ import logging
 import sys
 import time
 from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -87,171 +89,125 @@ def print_comparison(results: list[ModelResult], C: int) -> None:
             print(f"  {r.model_name:<28} {sign}{delta:.1f}% action0")
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Multi-model AU-AIR benchmark (vanilla → LoRA → TRM → TTA)."
     )
     parser.add_argument("--sequences", required=True,
                         help="JSONL from parse_auair.py or auair_sequences.jsonl")
+    parser.add_argument("--images-path", default=None,
+                        help="Root directory for AU-AIR images. Filenames from JSONL will be resolved relative to this.")
     parser.add_argument("--model-id", default="google/gemma-4-e4b-it",
                         help="HF model ID for Gemma 4")
     parser.add_argument("--lora-path", default=None,
                         help="Path to fine-tuned LoRA adapters (finetune_gemma_auair.py output)")
     parser.add_argument("--trm-checkpoint", default=None,
-                        help="Path to TRM student .pt checkpoint")
-    parser.add_argument("--tta-shots", type=int, default=0,
-                        help="If >0, also run test-time adaptation with this many adapt shots")
-    parser.add_argument("--tta-steps", type=int, default=20,
-                        help="Gradient steps for test-time adaptation")
-    parser.add_argument("--n-eval", type=int, default=300,
-                        help="Number of test sequences to evaluate")
-    parser.add_argument("--n-adapt", type=int, default=None,
-                        help="Number of sequences reserved for TTA adaptation (default=tta-shots)")
+                        help="Path to student checkpoint (train_trm_student.py output)")
+    parser.add_argument("--tta-shots", type=int, default=None,
+                        help="If set, performs test-time LoRA adaptation with this many shots.")
+    parser.add_argument("--n-eval", type=int, default=500,
+                        help="Number of samples to evaluate on (randomly sampled from sequences file).")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--temporal-window", type=int, default=4)
     parser.add_argument("--action-chunk-size", type=int, default=4)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output", default="artifacts/benchmark_auair.json",
-                        help="JSON output path for results")
-    parser.add_argument("--skip-vanilla", action="store_true",
-                        help="Skip vanilla Gemma baseline (saves ~10min if you only care about LoRA/TRM)")
+    parser.add_argument("--output-json", default="artifacts/auair_benchmark.json")
     args = parser.parse_args()
 
-    T, C = args.temporal_window, args.action_chunk_size
-    sequences_path = Path(args.sequences)
+    # Create output dir if needed
+    Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
 
-    logger.info(
-        "Benchmark config | model=%s  sequences=%s  n_eval=%d  seed=%d  T=%d  C=%d",
-        args.model_id, sequences_path, args.n_eval, args.seed, T, C,
+    # Load shared sequence list
+    seq_all = _load_sequences(Path(args.sequences), args.n_eval, args.seed)
+    results = []
+
+    # 1. Vanilla Gemma
+    res_vanilla = evaluate_gemma(
+        sequences=seq_all,
+        model_id=args.model_id,
+        temporal_window=args.temporal_window,
+        action_chunk_size=args.action_chunk_size,
+        images_path=args.images_path,
     )
+    results.append(res_vanilla)
 
-    # Load and split: adapt pool (for TTA) + eval pool
-    n_adapt = args.n_adapt or args.tta_shots
-    total_needed = args.n_eval + n_adapt
-    t0 = time.perf_counter()
-    all_seqs = _load_sequences(sequences_path, max_samples=total_needed, seed=args.seed)
-    adapt_seqs = all_seqs[:n_adapt]
-    eval_seqs = all_seqs[n_adapt: n_adapt + args.n_eval]
-    heuristic_rate = sum(s.get("used_heuristic", False) for s in eval_seqs) / max(len(eval_seqs), 1) * 100
-    logger.info(
-        "Sequences loaded in %.2fs — eval=%d  adapt=%d  heuristic_rate=%.1f%%",
-        time.perf_counter() - t0, len(eval_seqs), len(adapt_seqs), heuristic_rate,
-    )
-
-    results: list[ModelResult] = []
-
-    # ── 1. Vanilla baseline ──────────────────────────────────────────────────
-    if not args.skip_vanilla:
-        logger.info("[1/4] Starting vanilla Gemma 4 zero-shot evaluation")
-        t_step = time.perf_counter()
-        r = evaluate_gemma(
-            sequences=eval_seqs,
-            model_id=args.model_id,
-            lora_path=None,
-            temporal_window=T,
-            action_chunk_size=C,
-            model_name="gemma4_vanilla",
-        )
-        logger.info("[1/4] Vanilla done in %.1fs — action0=%.1f%%  parse=%.1f%%  halt=%.1f%%  latency=%.0fms",
-                    time.perf_counter() - t_step, r.action_acc, r.parse_rate, r.halt_acc, r.ms_per_sample)
-        results.append(r)
-        print(r.summary())
-    else:
-        logger.info("[1/4] Skipping vanilla baseline (--skip-vanilla)")
-
-    # ── 2. Fine-tuned LoRA ───────────────────────────────────────────────────
+    # 2. LoRA Gemma (if path provided)
     if args.lora_path:
-        logger.info("[2/4] Starting Gemma 4 + LoRA evaluation | lora=%s", args.lora_path)
-        t_step = time.perf_counter()
-        r = evaluate_gemma(
-            sequences=eval_seqs,
+        res_lora = evaluate_gemma(
+            sequences=seq_all,
             model_id=args.model_id,
             lora_path=args.lora_path,
-            temporal_window=T,
-            action_chunk_size=C,
-            model_name="gemma4_lora",
+            temporal_window=args.temporal_window,
+            action_chunk_size=args.action_chunk_size,
+            images_path=args.images_path,
         )
-        logger.info("[2/4] LoRA done in %.1fs — action0=%.1f%%  parse=%.1f%%  halt=%.1f%%  latency=%.0fms",
-                    time.perf_counter() - t_step, r.action_acc, r.parse_rate, r.halt_acc, r.ms_per_sample)
-        results.append(r)
-        print(r.summary())
-    else:
-        logger.info("[2/4] Skipping LoRA eval (--lora-path not set)")
+        results.append(res_lora)
 
-    # ── 3. TRM student ───────────────────────────────────────────────────────
+    # 3. TRM Reasoner (if checkpoint provided)
     if args.trm_checkpoint:
-        logger.info("[3/4] Starting TRM student evaluation | checkpoint=%s", args.trm_checkpoint)
-        t_step = time.perf_counter()
-        r = evaluate_trm(
-            sequences=eval_seqs,
+        res_trm = evaluate_trm(
+            sequences=seq_all,
             checkpoint_path=args.trm_checkpoint,
-            temporal_window=T,
-            action_chunk_size=C,
-            model_name="trm_student",
+            temporal_window=args.temporal_window,
+            action_chunk_size=args.action_chunk_size,
+            images_path=args.images_path,
         )
-        logger.info("[3/4] TRM done in %.1fs — action0=%.1f%%  halt=%.1f%%  latency=%.0fms",
-                    time.perf_counter() - t_step, r.action_acc, r.halt_acc, r.ms_per_sample)
-        results.append(r)
-        print(r.summary())
-    else:
-        logger.info("[3/4] Skipping TRM eval (--trm-checkpoint not set)")
+        results.append(res_trm)
 
-    # ── 4. Test-time LoRA adaptation (OOD resilience) ────────────────────────
-    if args.tta_shots > 0 and args.lora_path:
-        logger.info("[4/4] Starting TTA — %d shots, %d steps", args.tta_shots, args.tta_steps)
-        t_step = time.perf_counter()
-        r = adapt_and_evaluate_gemma(
-            adapt_sequences=adapt_seqs[:args.tta_shots],
-            eval_sequences=eval_seqs,
+    # 4. TTA adaptation (if shots requested)
+    if args.tta_shots and args.lora_path:
+        # Split: use first K for adaptation, rest for evaluation
+        # Note: we use the full set for eval but hide ground truth for those not in adapt set.
+        # For simplicity in this script, we take a disjoint evaluation set from the same file.
+        rng = np.random.default_rng(args.seed + 100)
+        all_recs = []
+        with open(args.sequences, encoding="utf-8") as f:
+            for line in f:
+                all_recs.append(json.loads(line))
+        
+        perm = rng.permutation(len(all_recs))
+        adapt_idx = perm[:args.tta_shots]
+        eval_idx = perm[args.tta_shots: args.tta_shots + args.n_eval]
+        
+        adapt_seq = [all_recs[i] for i in adapt_idx]
+        eval_seq = [all_recs[i] for i in eval_idx]
+
+        res_tta = adapt_and_evaluate_gemma(
+            adapt_sequences=adapt_seq,
+            eval_sequences=eval_seq,
             model_id=args.model_id,
             base_lora_path=args.lora_path,
-            adapt_lr=5e-5,
-            adapt_steps=args.tta_steps,
-            temporal_window=T,
-            action_chunk_size=C,
+            temporal_window=args.temporal_window,
+            action_chunk_size=args.action_chunk_size,
         )
-        logger.info("[4/4] TTA done in %.1fs — action0=%.1f%%  parse=%.1f%%  halt=%.1f%%  latency=%.0fms",
-                    time.perf_counter() - t_step, r.action_acc, r.parse_rate, r.halt_acc, r.ms_per_sample)
-        results.append(r)
-        print(r.summary())
-    else:
-        logger.info("[4/4] Skipping TTA (--tta-shots 0 or no --lora-path)")
+        results.append(res_tta)
 
-    if not results:
-        logger.warning("No models evaluated — pass at least --model-id for vanilla baseline")
-        print("\nNo models evaluated. Pass at least --model-id for vanilla baseline.")
-        return
+    # Print summary table
+    print_comparison(results, args.action_chunk_size)
 
-    # ── Print comparison ─────────────────────────────────────────────────────
-    print_comparison(results, C)
-
-    # ── Save JSON ────────────────────────────────────────────────────────────
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # Save to JSON
     report = {
-        "sequences_path": str(sequences_path),
-        "n_eval": len(eval_seqs),
-        "n_adapt": len(adapt_seqs),
-        "temporal_window": T,
-        "action_chunk_size": C,
+        "config": vars(args),
         "results": [
             {
                 "model_name": r.model_name,
-                "action_acc": round(r.action_acc, 2),
-                "chunk_acc": [round(v, 2) for v in r.chunk_acc],
-                "parse_rate": round(r.parse_rate, 2),
-                "halt_acc": round(r.halt_acc, 2),
-                "ms_per_sample": round(r.ms_per_sample, 1),
+                "action_acc": r.action_acc,
+                "chunk_acc": r.chunk_acc,
+                "parse_rate": r.parse_rate,
+                "halt_acc": r.halt_acc,
+                "ms_per_sample": r.ms_per_sample,
                 "n_samples": r.n_samples,
                 "n_heuristic": r.n_heuristic,
-                **r.extra,
+                "extra": r.extra,
             }
             for r in results
-        ],
+        ]
     }
-    output_path.write_text(json.dumps(report, indent=2))
-    logger.info("Results saved to %s", output_path)
-    print(f"\nResults saved to {output_path}")
+    with open(args.output_json, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    logger.info("Full report saved to %s", args.output_json)
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

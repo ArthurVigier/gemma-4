@@ -89,13 +89,15 @@ def _load_sequences(jsonl_path: Path, max_samples: int, seed: int = 42) -> list[
     return selected
 
 
-def _load_images(image_paths: list[str], T: int) -> list[Image.Image]:
+def _load_images(image_paths: list[str], T: int, images_path: str | None = None) -> list[Image.Image]:
     if len(image_paths) < T:
         image_paths = [image_paths[0]] * (T - len(image_paths)) + image_paths
     images = []
+    base = Path(images_path) if images_path else None
     for p in image_paths[-T:]:
         try:
-            images.append(Image.open(p).convert("RGB"))
+            resolved = base / Path(p).name if base else Path(p)
+            images.append(Image.open(resolved).convert("RGB"))
         except Exception:
             images.append(Image.new("RGB", (640, 480), color=(80, 80, 80)))
     return images
@@ -258,6 +260,7 @@ def evaluate_trm(
     action_chunk_size: int = 4,
     device: str = "cuda",
     model_name: str | None = None,
+    images_path: str | None = None,
 ) -> ModelResult:
     """Evaluate TRM student checkpoint on AU-AIR sequences."""
     from .model import TRMReasoner
@@ -295,7 +298,7 @@ def evaluate_trm(
     import tempfile, json as _json
     tmp = Path(tempfile.mktemp(suffix=".jsonl"))
     tmp.write_text("\n".join(_json.dumps(s) for s in sequences))
-    ds = AuAirStudentDataset(sequences_jsonl=tmp, reasoner_config=rc)
+    ds = AuAirStudentDataset(jsonl_path=tmp, reasoner_config=rc, images_path=images_path)
     tmp.unlink(missing_ok=True)
 
     for i, seq in enumerate(sequences):

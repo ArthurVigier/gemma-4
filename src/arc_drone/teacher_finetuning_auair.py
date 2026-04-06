@@ -64,6 +64,7 @@ def _user_prompt(T: int, C: int) -> str:
 class AuAirTeacherConfig:
     foundation_model_id: str = "google/gemma-4-e4b-it"
     auair_path: str = "data/auair_sequences.jsonl"
+    auair_images_path: str | None = None
     temporal_window: int = 4
     action_chunk_size: int = 4
     eval_ratio: float = 0.1
@@ -101,10 +102,12 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
         max_length: int,
         temporal_window: int = 4,
         action_chunk_size: int = 4,
+        images_path: str | Path | None = None,
     ) -> None:
         self.processor = processor
         self.T = temporal_window
         self.C = action_chunk_size
+        self.images_path = Path(images_path) if images_path else None
 
         image_seq_length = getattr(processor, "image_seq_length", 280)
         try:
@@ -166,8 +169,14 @@ class AuAirTeacherDataset(Dataset[dict[str, torch.Tensor]]):
         images = []
         for p in image_paths:
             try:
-                images.append(Image.open(p).convert("RGB"))
-            except Exception:
+                if self.images_path:
+                    # Resolve relative to provided images root
+                    resolved_path = self.images_path / Path(p).name
+                else:
+                    resolved_path = Path(p)
+                images.append(Image.open(resolved_path).convert("RGB"))
+            except Exception as e:
+                logger.warning("Failed to load image %s: %s. Using fallback gray frame.", p, e)
                 images.append(Image.new("RGB", (640, 480), color=(80, 80, 80)))
 
         # Compose T frames into single mosaic (avoids transformers 5.5.0 5D pixel_values bug)

@@ -61,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auair-path", default=None,
                         help="Path to auair_sequences.jsonl. When set, distills from real AU-AIR "
                              "frames via multimodal teacher instead of synthetic ARC tasks.")
+    parser.add_argument("--auair-images-path", default=None,
+                        help="Root directory for AU-AIR images. Filenames from JSONL will be resolved relative to this.")
     return parser.parse_args()
 
 
@@ -107,6 +109,7 @@ def main() -> int:
             teacher_temperature=args.teacher_temperature,
             teacher_max_length=args.teacher_max_length,
             auair_path=args.auair_path,
+            auair_images_path=args.auair_images_path,
         )
     )
     logger.info(
