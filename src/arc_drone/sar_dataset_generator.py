@@ -20,47 +20,54 @@ class CrisisVLMDatasetGenerator:
         self.generator = SARScenarioGenerator()
 
     def generate_training_sample(self, scenario_type: str) -> dict[str, Any]:
-        """Creates a single multimodal training sample."""
+        """Creates a sample with structured Reasoning Traces (Chain of Thought)."""
         
         if scenario_type == "flood":
             scenario = self.generator.generate_flood_scenario(f"flood_{random.randint(0,999)}")
         else:
             scenario = self.generator.generate_fire_scenario(f"fire_{random.randint(0,999)}")
             
-        # 1. User Prompt (Context + Visual description)
+        # User Prompt
         prompt = (
-            f"You are an Emergency AI Dispatcher. Analyze the provided video sequence from drone Alpha.\n"
-            f"Mission Type: {scenario.type.value.upper()}\n"
-            f"Fleet Status: Drone Alpha at {random.randint(20, 95)}% battery.\n"
-            "Identify the highest priority target and issue a SAR_ACTION command in JSON."
+            f"EMERGENCY DISPATCH PROTOCOL: Analyze drone Alpha video feed.\n"
+            f"SCENARIO: {scenario.type.value.upper()}\n"
+            f"FLEET: Alpha (Battery: {random.randint(20, 95)}%).\n"
+            "Evaluate entities and execute SAR_ACTION."
         )
         
-        # 2. Assistant Response (Thinking + Reasoning + JSON)
-        # We find the priority 1 entity
-        victims = [e for e in scenario.entities if e.priority == 1]
-        target = victims[0] if victims else scenario.entities[0]
+        # Identify targets
+        entities = scenario.entities
+        primary_target = min(entities, key=lambda e: e.priority)
         
-        # Structure the 'Thinking' process to train the model's internal logic
+        # Structured Reasoning Trace
         thinking_chain = (
-            f"I see {len(scenario.entities)} objects of interest in this sequence. "
-            f"The environment shows active {scenario.type.value}. "
-            f"I have identified a {target.type.value} which corresponds to: '{target.description}'. "
-            "According to SAR protocols, human life preservation is priority #1. "
-            "I must command the drone to hold position and signal the rescue team."
+            f"[OBSERVATION] The video sequence reveals {len(entities)} distinct entities in an active {scenario.type.value} environment. "
+            f"Found: {', '.join([e.description for e in entities])}. "
+            "[PRIORITY ANALYSIS] Comparing risks. "
+        )
+        
+        if len(entities) > 1:
+            thinking_chain += (
+                f"Entity '{primary_target.id}' (Priority {primary_target.priority}) presents a more critical life-safety risk "
+                f"than other observed hazards. Battery levels are sufficient for immediate intervention. "
+            )
+        
+        thinking_chain += (
+            f"[DECISION] Prioritizing {primary_target.type.value}. "
+            "Reason: Human life preservation mandate (Protocol IAMSAR). "
+            "Action: Deploy signal and hold position for rescue team."
         )
         
         action_json = {
             "drone_id": "Alpha",
             "command": "HOVER_AND_SIGNAL",
-            "params": {"target": target.pose, "frequency": "HIGH"},
+            "params": {"target": primary_target.pose, "frequency": "HIGH"},
             "reasoning": thinking_chain
         }
         
-        # Final Conversation Format for Gemma-4 / Unsloth
+        # Conversation Format with <|think|> for Gemma-4 26B MoE
         messages = [
-            {"role": "user", "content": [
-                {"type": "text", "text": prompt}
-            ]},
+            {"role": "user", "content": [{"type": "text", "text": prompt}]},
             {"role": "assistant", "content": [
                 {"type": "text", "text": f"<|think|>\n{thinking_chain}\n\n{json.dumps(action_json)}"}
             ]}
@@ -69,8 +76,7 @@ class CrisisVLMDatasetGenerator:
         return {
             "id": scenario.scenario_id,
             "messages": messages,
-            # In a real run, paths to simulated Isaac frames would go here
-            "image_descriptions": [e.description for e in scenario.entities] 
+            "target_priority": primary_target.priority
         }
 
     def build_dataset(self, count: int = 1000):
