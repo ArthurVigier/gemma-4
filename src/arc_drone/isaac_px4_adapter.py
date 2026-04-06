@@ -75,8 +75,11 @@ class IsaacPX4Adapter:
             return (pos[0], pos[1], pos[2])
         return (0.0, 0.0, 0.0)
 
-    def get_camera_image(self):
+    def get_camera_image(self) -> Image.Image:
         """Captures the photorealistic RGB frame from the drone's POV."""
-        # TODO: Implement OmniGraph/Reproduction camera capture
-        # This will provide the 'real' imagery for Gemma-4
-        pass
+        if self.vehicle:
+            # TODO: Link to real Isaac Sim viewport capture
+            pass
+            
+        # Return dummy frame for dev
+        return Image.new("RGB", (224, 224), color=(30, 30, 30))
