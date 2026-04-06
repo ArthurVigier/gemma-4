@@ -111,6 +111,7 @@ def main() -> int:
     parser.add_argument("--temporal-window", type=int, default=4)
     parser.add_argument("--action-chunk-size", type=int, default=4)
     parser.add_argument("--output-json", default="artifacts/auair_benchmark.json")
+    parser.add_argument("--skip-vanilla", action="store_true", help="Skip the un-finetuned baseline.")
     args = parser.parse_args()
 
     # Create output dir if needed
@@ -121,14 +122,15 @@ def main() -> int:
     results = []
 
     # 1. Vanilla Gemma
-    res_vanilla = evaluate_gemma(
-        sequences=seq_all,
-        model_id=args.model_id,
-        temporal_window=args.temporal_window,
-        action_chunk_size=args.action_chunk_size,
-        images_path=args.images_path,
-    )
-    results.append(res_vanilla)
+    if not args.skip_vanilla:
+        res_vanilla = evaluate_gemma(
+            sequences=seq_all,
+            model_id=args.model_id,
+            temporal_window=args.temporal_window,
+            action_chunk_size=args.action_chunk_size,
+            images_path=args.images_path,
+        )
+        results.append(res_vanilla)
 
     # 2. LoRA Gemma (if path provided)
     if args.lora_path:
